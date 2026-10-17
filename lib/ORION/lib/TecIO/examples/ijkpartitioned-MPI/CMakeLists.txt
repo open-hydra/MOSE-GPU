@@ -1,0 +1,7 @@
+add_executable(ijkpartitioned "ijkpartitioned.cpp")
+if (WIN32)
+    target_link_libraries(ijkpartitioned teciompi)
+else ()
+    target_link_libraries(ijkpartitioned teciompi pthread)
+endif ()
+target_link_libraries(ijkpartitioned MPI::MPI_CXX)

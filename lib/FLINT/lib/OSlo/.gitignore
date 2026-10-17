@@ -1,0 +1,12 @@
+# Build
+build
+CMakePresets.json
+
+# Intsallation directories
+sundials-install
+
+# Executables
+bin
+
+# Fortran module files
+*.mod

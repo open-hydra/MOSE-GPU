@@ -1,0 +1,6 @@
+add_executable(ij_ordered "ij_ordered.cpp")
+if (WIN32)
+    target_link_libraries(ij_ordered tecio)
+else ()
+    target_link_libraries(ij_ordered tecio pthread)
+endif ()

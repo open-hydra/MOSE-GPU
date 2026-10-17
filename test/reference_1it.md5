@@ -1,0 +1,25 @@
+# md5 (first 8 hex digits) of OUTPUT/field.tec after one iteration of each test case of MOSE b29130b, staged by run_mose_tests.py
+# with --one-iteration; binaries built by install.sh build --production (V100 and A30 give the same bits).
+1D_diff1                                      80569e2a
+1D_diff2                                      f5823888
+1D_Ein91                                      d27942d1
+1D_Noh87                                      5a1ec5d3
+1D_Shu-Osher                                  223abf43
+1D_Sod79                                      fec6a7c7
+1D_Tor99                                      9daf2699
+2D_euler_chang-nozzle                         d7704729
+2D_euler_gresho-vortex                        f56fae59
+2D_euler_hypersonic-cylinder                  8cfdaaa3
+2D_euler_isentropic-vortex                    a209968f
+2D_euler_oblique-shock                        3cca37a9
+2D_euler_prandtl-meyer                        7051c39c
+2D_euler_ramp-channel                         b9c102b0
+2D_euler_rocket-nozzle_frozen                 5043df02
+2D_euler_supersonic-forward-step              ea539855
+2D_viscous_flat-plate-laminar                 be537105
+2D_viscous_flat-plate-turbulent_SA            fc0f97ab
+2D_viscous_flat-plate-turbulent_SST           30467ee7
+2D_viscous_mms                                c6480015
+2D_viscous_swbli_SA                           554e3298
+2D_viscous_swbli_SST                          9c837cee
+3D_pressure-centrifugal                       1abc251d

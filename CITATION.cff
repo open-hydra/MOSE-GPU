@@ -1,0 +1,48 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with MOSE."
+title: "MOSE-GPU: the GPU version of MOSE"
+abstract: >-
+  The GPU version of MOSE, an open-source compressible flow solver for the Euler
+  and Navier-Stokes equations on multi-block structured grids: the same
+  equations, numerical methods and input files, with every kernel of the time
+  step on NVIDIA GPUs (OpenACC and CUDA Fortran) and one GPU per MPI rank.
+type: software
+version: 0.1.0
+date-released: 2026-10-18
+authors:
+  - family-names: Falco
+    given-names: Alex
+    affiliation: Sapienza University of Rome
+  - family-names: Grossi
+    given-names: Marco
+    affiliation: Sapienza University of Rome
+    orcid: https://orcid.org/0000-0002-8487-1932
+  - family-names: Montanari
+    given-names: Alessandro
+    affiliation: Sapienza University of Rome
+contact:
+  - family-names: Falco
+    given-names: Alex
+license: GPL-3.0-only
+repository-code: https://github.com/open-hydra/MOSE-GPU
+url: https://open-hydra.github.io/MOSE-GPU/
+keywords:
+  - computational fluid dynamics
+  - compressible flow
+  - Navier-Stokes
+  - GPU
+  - OpenACC
+  - CUDA Fortran
+  - Fortran
+references:
+  - type: software
+    title: "MOSE: Multipurpose Open Solver for ideal-gas Equations"
+    authors:
+      - family-names: Grossi
+        given-names: Marco
+      - family-names: Falco
+        given-names: Alex
+      - family-names: Montanari
+        given-names: Alessandro
+    doi: 10.5281/zenodo.20201352
+    repository-code: https://github.com/open-hydra/MOSE

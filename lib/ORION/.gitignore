@@ -1,0 +1,37 @@
+# Build
+build
+.setvars.sh
+CMakePresets.json
+
+# Executables
+bin/
+
+# TecIO files
+tecio-install*
+teciompi-install*
+tecio-build*
+teciompi-build*
+lib/TecIO/boost
+lib/TecIO/teciosrc/boost
+
+# Distribution / packaging
+.Python
+env/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# doc files
+doc/html
+doc/latex
+
+# Fortran module files
+*.mod

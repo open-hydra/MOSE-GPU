@@ -1,0 +1,27 @@
+# Build
+CMakePresets.json
+build
+build_*/
+bin
+*.exe
+
+# Fortran module files
+mod
+*.mod
+
+# Generated at configure time
+src/lib/mose_ct_dims.inc
+
+# Run output
+OUTPUT
+.ID
+logfile
+error*
+mose_*.out
+slurm_*.out
+
+# Documentation site
+site
+
+# Python
+__pycache__/

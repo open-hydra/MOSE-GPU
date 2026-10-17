@@ -1,0 +1,6 @@
+add_executable(rewriteszl "rewriteszl.cpp")
+if (WIN32)
+    target_link_libraries(rewriteszl tecio)
+else ()
+    target_link_libraries(rewriteszl tecio pthread)
+endif ()

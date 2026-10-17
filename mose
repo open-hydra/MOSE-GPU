@@ -1,0 +1,843 @@
+#!/usr/bin/env python3
+"""mose -- check, build and launch a MOSE_GPU case from its own input.ini.
+
+  mose check  [CASE]                  what the case needs and whether the GPU build runs it
+  mose build  [CASE]                  make sure the matching binary exists (submits its build job if not)
+  mose submit [CASE] [-n N] [-p PART] [-t TIME] [-J NAME] [--mem MEM] [--nodelist NODE] [--dry-run]
+  mose list                           the binaries already built
+  mose example                        print an annotated GPU input.ini
+
+CASE is the case folder (default: the current one): input.ini + INPUT/.
+
+The binary is chosen from the case, nothing is set by hand:
+  species count         lines after the first of INPUT/phase.txt (the count FLINT reads)
+  turbulence equations  [MOSE-RANS] turbulence-model (no RANS section = Euler), or in the MOSE_open dialect
+                        [MOSE-Physics] equations + turbulence
+  chemistry integrator  [MOSE-ODE] solver = H-radau5 (default) or H-rodas ([MOSE-Chemistry] ode-solver)
+A case written in the MOSE_open dialect ([MOSE-Parameters], [MOSE-Numerics], [MOSE-Physics] equations) runs as it is:
+the code translates it at start-up (src/lib/io/IO_Ini_Open.f90) and stops with a message on what the GPU lacks;
+`mose check` applies the same rules before the queue.
+Each combination is built once per state of the source tree with the certified recipe
+`install.sh build --production --nsc=N --nrans=R [--ode-rodas]` (a job on the free partition, ~3 min),
+kept read-only in $MOSE_BUILDS (default /scratch/$USER/mose_builds) and reused by every later run.
+The run job waits for the build job (--dependency=afterok) when the binary is not there yet.
+
+Environment: MOSE_SRC (source tree to build, default: the tree this script is in), MOSE_BUILDS,
+MOSE_BUILD_PARTITION (default free). Python 3.6+, standard library only.
+"""
+import argparse
+import fcntl
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import OrderedDict
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+NVHPC = os.environ.get('NVHPC_ROOT', '/opt/share/libs/nvidia/hpc_sdk/Linux_x86_64/24.11')
+SLURM_FALLBACK = '/opt/share/sw/gcc-8.5.0/slurm-23.11.3/bin'   # sbatch/squeue when a non-login shell lacks them
+
+# What the GPU build runs. Anything else stops the binary (or, for the turbulence models, is not computed
+# on the device), so mose refuses it before the job waits in the queue.
+GPU_MECHANISMS = ('ONERA-7', 'Frolov_nopressure')    # FLINT Assign_Mechanism: device dispatch ids 1, 2
+GPU_LIMITERS = ('MINMOD', 'MinMod', 'Min-Mod', 'VANLEER', 'VanLeer', 'Van Leer', 'VANALBADA', 'VanAlbada', 'Van Albada',
+                'MC', 'SUPERBEE', 'Super-Bee', 'Super Bee', 'IORD')   # Lib_Limiters.f90: lim_dev = 1..6 (rlimiter)
+GPU_RIEMANN = ('HLLC Batten', 'HLLC', 'HLLE', 'SLAU',   # Lib_Riemann.f90: rs_dev = 1, 2, 3
+               'AUSM+', 'AUSM+M', 'HLLE++', 'HLLC+Tramel', 'LLF', 'Rusanov', 'SLAU2', 'HLLC+Chen', 'exact',
+               'LMRoe', 'MiczekRoe', 'HLLC-PC')   # rs_dev = 4..14, MOSE_open's (riemann_open_body.inc)
+GPU_ODE = OrderedDict([('H-radau5', 'radau5'),        # radau5_dev = device port of Hairer RADAU5 (production)
+                       ('H-rodas', 'rodas')])         # rodas_dev  = device port of Hairer RODAS  (MOSE_ODE_RODAS)
+
+# The certified production recipe; the case adds --nsc, --nrans and --ode-rodas.
+RECIPE = ['--production']
+# What the build reads (CMakeLists.txt: src/lib + ORION + FLINT (+ OSlo) + FiNeR).
+BUILD_PATHS = ('src', 'cmake', 'CMakeLists.txt', 'install.sh', 'lib/FLINT', 'lib/ORION', 'lib/third_party/FiNeR')
+SUBTREES = ('lib/FLINT', 'lib/ORION', 'lib/third_party/FiNeR', 'lib/FLINT/lib/OSlo')
+SNAPSHOT_EXCLUDES = ('.git', '/bin/', '/build*/', '/test/', '/docs/')   # the proven build_prod.sbatch copy
+
+# input.ini keys written the MOSE_open way, and what the GPU code reads instead.
+OPEN_SECTIONS = {
+    'MOSE-Parameters': '[MOSE-parameters] (section names are case-sensitive)',
+    'MOSE-Probes': '[MOSE-probes] (section names are case-sensitive)',
+    'MOSE-Multigrid': '[MOSE-multigrid] (section names are case-sensitive)',
+}
+OPEN_KEYS = {
+    ('MOSE-Physics', 'equations'): 'no [MOSE-RANS] section = Euler; [MOSE-RANS] turbulence-model = laminar or SST = Navier-Stokes',
+    ('MOSE-Physics', 'turbulence'): '[MOSE-RANS] turbulence-model',
+    ('MOSE-Physics', 'chemistry'): 'finite-rate = INPUT/chemistry-info.txt present, frozen = no such file',
+    ('MOSE-Chemistry', 'ode-solver'): '[MOSE-ODE] solver (H-radau5 or H-rodas on the GPU)',
+    ('MOSE-Physics', 'ode-solver'): '[MOSE-ODE] solver (H-radau5 or H-rodas on the GPU)',
+    ('MOSE-Chemistry', 'ode-max-steps'): '[MOSE-ODE] max-steps-ode',
+    ('MOSE-Chemistry', 'ode-analytical-jacobian'): '[MOSE-ODE] analytical-jacobian',
+    ('MOSE-Chemistry', 'ode-relative-tol-species'): '[MOSE-ODE] relative-tol-species',
+    ('MOSE-Chemistry', 'ode-absolute-tol-species'): '[MOSE-ODE] absolute-tol-species',
+    ('MOSE-Chemistry', 'ode-relative-tol-temperature'): '[MOSE-ODE] relative-tol-pressure (same slot: the last ODE unknown)',
+    ('MOSE-Chemistry', 'ode-absolute-tol-temperature'): '[MOSE-ODE] absolute-tol-pressure (same slot: the last ODE unknown)',
+    ('MOSE-Chemistry', 'exclude-blocks'): '[MOSE-nochem] blocks',
+    ('MOSE-Turbulence', 'Prt'): '[MOSE-RANS] Prt',
+    ('MOSE-Turbulence', 'Sct'): '[MOSE-RANS] Sct',
+    ('MOSE-Numerics', 'time-scheme'): '[MOSE-scheme] RK = 1 | 2 | 3 (euler | RK2 | RK3)',
+    ('MOSE-Numerics', 'cfl'): '[MOSE-parameters] cfl',
+    ('MOSE-Numerics', 'vnn'): '[MOSE-parameters] vnn',
+    ('MOSE-Numerics', 'cfl-rise-threshold'): '[MOSE-parameters] cfl-rise-threshold',
+    ('MOSE-Numerics', 'time-accurate'): '[MOSE-parameters] time-accurate',
+    ('MOSE-Numerics', 'integration-variables'): '[MOSE-scheme] integration-variables',
+    ('MOSE-Numerics', 'space-reconstruction'): 'MUSCL is implied by [MOSE-scheme] limiter = MINMOD',
+    ('MOSE-Numerics', 'flux-limiter'): '[MOSE-scheme] limiter = MINMOD (the only limiter on the GPU)',
+    ('MOSE-Numerics', 'riemann-solver'): '[MOSE-scheme] riemann = HLLC (the only Riemann solver on the GPU)',
+    ('MOSE-IO', 'res-diter'): '[MOSE-IO] diter-res',
+    ('MOSE-IO', 'diter-shell'): '[MOSE-IO] shell-diter',
+}
+# The MOSE_open keys the code translates at start-up (IO_Ini_Open.f90): no warning for them in that dialect.
+OPEN_TRANSLATED = {
+    'MOSE-Parameters': ('newrun', 'iter-threshold', 'time-threshold', 'res-threshold'),
+    'MOSE-Numerics': ('cfl', 'vnn', 'cfl-rise-threshold', 'time-accurate', 'time-scheme', 'integration-variables', 'irs',
+                      'irs-beta', 'space-reconstruction', 'flux-limiter', 'shock-detector', 'riemann-solver',
+                      'preconditioning-eps-min', 'preconditioning-Uref', 'preconditioning-Mach', 'preconditioning-Ur-min',
+                      'preconditioning-Ur-factor', 'preconditioning-Ur-smooth'),
+    'MOSE-Physics': ('equations', 'turbulence', 'chemistry', 'soot-generation', 'rotational-frame', 'schmidt', 'prandtl'),
+    'MOSE-Chemistry': ('ode-solver', 'ode-max-steps', 'ode-analytical-jacobian', 'ode-relative-tol-species',
+                       'ode-absolute-tol-species', 'ode-relative-tol-temperature', 'ode-absolute-tol-temperature',
+                       'exclude-blocks'),
+    'MOSE-Turbulence': ('Prt', 'Sct', 'point-implicit', 'omega-wall-bc', 'sst-production', 'k-energy-coupling'),
+    'MOSE-IO': ('ic-format', 'res-diter', 'timer-diter'),
+    'MOSE-Multigrid': ('levels',),
+    'MOSE-Rotating-Frame': ('omega', 'axis', 'origin'),
+}
+GPU_MODELS = {'laminar': (0, 'laminar Navier-Stokes', True), 'SA': (1, 'Spalart-Allmaras', True),
+              'SA-R': (1, 'Spalart-Allmaras with rotation correction', True), 'SST': (2, 'SST k-omega', True),
+              'Wilcox2006': (2, 'Wilcox 2006 k-omega', True),
+              'SA-RC': (1, 'Spalart-Allmaras with the rotation/curvature correction (Spalart-Shur)', True),
+              'SST-RC': (2, 'SST k-omega with the rotation/curvature correction (Smirnov-Menter)', True),
+              'SAcomp': (1, 'Spalart-Allmaras with the compressibility correction (Paciorri-Sabetta)', True)}
+
+
+def is_open_dialect(secs):
+    return 'MOSE-Parameters' in secs or 'MOSE-Numerics' in secs or ini_get(secs, 'MOSE-Physics', 'equations') is not None
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------------------------------- input.ini
+def read_ini(path):
+    """input.ini as FiNeR reads it: comment lines start with ! ; #, text after ; is an inline comment,
+    names are compared exactly (case included). Returns (OrderedDict section -> OrderedDict key -> value,
+    list of duplicated 'section' / 'section key' names)."""
+    secs, dups, cur = OrderedDict(), [], None
+    with open(path, errors='replace') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line[0] in '!;#':
+                continue
+            if line[0] == '[' and ']' in line:
+                name = line[1:line.index(']')].strip()
+                if name in secs:
+                    dups.append('[%s]' % name)
+                cur = secs.setdefault(name, OrderedDict())
+                continue
+            if '=' in line and cur is not None:
+                k, v = line.split('=', 1)
+                k, v = k.strip(), v.split(';', 1)[0].strip()
+                if k in cur:
+                    dups.append('%s in its section' % k)
+                cur.setdefault(k, v)
+    return secs, dups
+
+
+def ini_get(secs, section, key, default=None):
+    return secs.get(section, {}).get(key, default)
+
+
+def as_logical(v):
+    """Fortran list-directed logical: T, .true., true, t... (first letter after the optional dot)."""
+    s = v.strip().lstrip('.').lower()
+    if s[:1] in ('t', 'f'):
+        return s[0] == 't'
+    raise ValueError(v)
+
+
+# ---------------------------------------------------------------------------------------------------- the case
+def bc_inflow_records(path):
+    """Records of INPUT/bc.txt that the GPU code runs as its inflow/outflow (MOSE_open 401-405 and 407): the header
+    lines are six integers (block, i, j, k, face, type); property lines carry reals."""
+    n = 0
+    with open(path, errors='replace') as f:
+        for line in f:
+            w = line.split()
+            if len(w) == 6 and w[5] in ('401', '402', '403', '404', '405', '407') and all(x.isdigit() for x in w):
+                n += 1
+    return n
+
+
+def read_case(case, src):
+    """Everything mose needs from the case, plus the errors (stop) and warnings (go on) found on the way."""
+    c = {'case': case, 'errors': [], 'warnings': [], 'notes': OrderedDict()}
+    err, warn, note = c['errors'].append, c['warnings'].append, c['notes']
+    ini = os.path.join(case, 'input.ini')
+    if not os.path.isfile(ini):
+        raise Fail('%s: no input.ini' % case)
+    secs, dups = read_ini(ini)
+    c['secs'] = secs
+    for d in dups:
+        warn('input.ini repeats %s: write it once (which copy the code takes is not guaranteed)' % d)
+
+    if not os.path.realpath(case).startswith('/scratch/'):
+        err('the case is not on /scratch: the GPU nodes run only there')
+
+    # species: the count FLINT reads from INPUT/phase.txt (Load_ThermoTransport: every line after the first)
+    phase = os.path.join(case, 'INPUT', 'phase.txt')
+    if os.path.isfile(phase):
+        with open(phase, errors='replace') as f:
+            c['nsc'] = len(f.read().splitlines()) - 1
+        note['species'] = '%d  (INPUT/phase.txt)' % c['nsc']
+        if c['nsc'] < 1:
+            err('INPUT/phase.txt lists no species')
+    else:
+        c['nsc'] = None
+        err('INPUT/phase.txt missing: the species count comes from it')
+    if not os.path.exists(os.path.join(case, 'INPUT', 'bc.txt')):
+        err('INPUT/bc.txt missing: the boundary conditions')
+    # the features this version does not have (the binary stops on them too: IO_Ini, Stop_On_Removed_Keys)
+    for k, what in (('multirate', 'multirate (branch multirate of DIMA-THRUST/MOSE)'),
+                    ('j-implicit', 'line-implicit operator (last in 85e3b63 of mose-launcher)'),
+                    ('imex', 'IMEX integrator (last in 85e3b63 of mose-launcher)')):
+        v = ini_get(secs, 'MOSE-scheme', k)
+        if v is not None and v.strip().lower() not in ('f', 'false', '.false.'):
+            err('[MOSE-scheme] %s = %s: this version of the code has no %s' % (k, v, what))
+    v = ini_get(secs, 'MOSE-scheme', 'solver-type')
+    if v is not None and v.strip().lower() != 'explicit':
+        err('[MOSE-scheme] solver-type = %s: only explicit in this version (MOSE_open has no implicit solver)' % v)
+    # rotating frame: the device inflow has no absolute -> relative conversion of the inlet state (RF_Convert_BC_Inflow)
+    rf = (ini_get(secs, 'MOSE-Physics', 'rotational-frame', 'none') or 'none').strip() == 'rigid-body'
+    try:
+        rf = rf or as_logical(ini_get(secs, 'MOSE-rotating-frame', 'active', 'f'))
+    except ValueError:
+        pass
+    if rf and os.path.exists(os.path.join(case, 'INPUT', 'bc.txt')):
+        n = bc_inflow_records(os.path.join(case, 'INPUT', 'bc.txt'))
+        if n:
+            err('rotating frame with %d inlet/outlet records (MOSE_open 401-405, 407) in INPUT/bc.txt: '
+                'the inflow in the rotating frame is not on the GPU' % n)
+
+    # chemistry: finite-rate when INPUT/chemistry-info.txt exists; its first word names the mechanism
+    info = os.path.join(case, 'INPUT', 'chemistry-info.txt')
+    c['mech'] = None
+    opn = is_open_dialect(secs)
+    c['open'] = opn
+    if opn:
+        note['dialect'] = 'MOSE_open (translated by the code at start-up, IO_Ini_Open.f90)'
+        chem = ini_get(secs, 'MOSE-Physics', 'chemistry', 'frozen')
+        if chem == 'equilibrium':
+            err('[MOSE-Physics] chemistry = equilibrium is not on the GPU (frozen or finite-rate)')
+        elif chem == 'finite-rate' and not os.path.isfile(info):
+            err('[MOSE-Physics] chemistry = finite-rate needs INPUT/chemistry-info.txt')
+        elif chem == 'frozen' and os.path.isfile(info):
+            note['chemistry'] = 'frozen  ([MOSE-Physics] chemistry = frozen; INPUT/chemistry-info.txt present but not read)'
+            info = ''
+        elif chem not in ('frozen', 'finite-rate'):
+            err('[MOSE-Physics] chemistry = %s: frozen, finite-rate or equilibrium' % chem)
+    if os.path.isfile(info):
+        with open(info, errors='replace') as f:
+            first = f.readline().replace(',', ' ').split()
+        c['mech'] = first[0].strip('\'"') if first else ''
+        ok = c['mech'] in GPU_MECHANISMS
+        note['chemistry'] = '%s  (INPUT/chemistry-info.txt)%s' % (c['mech'], '' if ok else '  NOT ON THE GPU')
+        if not ok:
+            err('mechanism %r: the GPU integrates only %s' % (c['mech'], ' / '.join(GPU_MECHANISMS)))
+    else:
+        note['chemistry'] = 'frozen  (no INPUT/chemistry-info.txt)'
+
+    # turbulence: the order of Mod_RANS.f90 (substring tests on the model name), or the MOSE_open keys
+    if opn:
+        eq = ini_get(secs, 'MOSE-Physics', 'equations', '')
+        has_rans = (eq == 'navier-stokes')
+        model = (ini_get(secs, 'MOSE-Physics', 'turbulence', 'none') or 'none') if has_rans else 'inviscid'
+        if model in ('none', ''):
+            model = 'laminar'
+        if eq not in ('euler', 'navier-stokes'):
+            err('[MOSE-Physics] equations = %s: euler or navier-stokes (required)' % (eq or '(missing)'))
+        src_note = '[MOSE-Physics] equations = %s, turbulence' % eq
+    else:
+        has_rans = any('RANS' in s for s in secs)
+        model = ini_get(secs, 'MOSE-RANS', 'turbulence-model', 'laminar') if has_rans else 'inviscid'
+        src_note = '[MOSE-RANS] turbulence-model' if has_rans else 'no [MOSE-RANS] section'
+    if opn and has_rans and model in GPU_MODELS:
+        c['nrans'], kind, gpu = GPU_MODELS[model]
+    elif opn and has_rans:
+        c['nrans'], kind, gpu = 0, model, False
+        err('[MOSE-Physics] turbulence = %s is not on the GPU: use SST, SST-RC, Wilcox2006, SA, SA-R, SA-RC, SAcomp or none' % model)
+        gpu = True   # already reported
+    elif 'laminar' in model:
+        c['nrans'], kind, gpu = 0, 'laminar Navier-Stokes', True
+    elif 'SA' in model:
+        c['nrans'], kind = 1, 'Spalart-Allmaras'
+        gpu = not ('QCR' in model)   # QCR2000: host only
+    elif 'Wilcox2006' in model:
+        c['nrans'], kind, gpu = 2, 'Wilcox 2006 k-omega', True
+    elif 'SST' in model:
+        c['nrans'], kind, gpu = 2, 'SST k-omega', True
+    elif 'SSGLRR' in model:
+        c['nrans'], kind, gpu = 7, 'SSG/LRR-omega', False
+    else:
+        c['nrans'], kind, gpu = 0, 'Euler (inviscid)', True
+        if has_rans and model.lower() not in ('inviscid', 'euler'):
+            err('[MOSE-RANS] turbulence-model = %s is not a model name: the code would run inviscid' % model)
+    note['turbulence'] = '%s, %d equation(s)  (%s)%s' % (kind, c['nrans'], src_note, '' if gpu else '  NOT ON THE GPU')
+    if not gpu and (not opn or model in GPU_MODELS):
+        err('%s (%s): the GPU computes SST, SST-RC, Wilcox2006, SA, SA-R, SA-RC and SAcomp only (diff_physics.inc, sst_body.inc, wilcox_body.inc, sa_body.inc); use one of those, laminar or Euler' % (kind, model))
+
+    # chemistry integrator: compile-time on the GPU (radau5_dev or rodas_dev)
+    solver = ini_get(secs, 'MOSE-Chemistry', 'ode-solver', 'H-radau5') if opn else ini_get(secs, 'MOSE-ODE', 'solver', 'H-radau5')
+    if c['mech']:
+        if solver in GPU_ODE:
+            c['ode'] = GPU_ODE[solver]
+            given = ('MOSE-Chemistry' in secs and 'ode-solver' in secs['MOSE-Chemistry']) if opn else ('MOSE-ODE' in secs and 'solver' in secs['MOSE-ODE'])
+            note['integrator'] = '%s  (%s%s)' % (solver, '[MOSE-Chemistry] ode-solver' if opn else '[MOSE-ODE] solver', '' if given else ', default')
+        else:
+            c['ode'] = 'radau5'
+            err('[MOSE-ODE] solver = %s: the GPU integrates the chemistry with %s only' % (solver, ' or '.join(GPU_ODE)))
+    else:
+        c['ode'] = 'radau5'   # no chemistry: the integrator is not used, share the default binary
+        note['integrator'] = 'not used (frozen flow)'
+
+    # convective scheme: Min-Mod + HLLC only (Convective_assert_scheme)
+    if opn:
+        lim = ini_get(secs, 'MOSE-Numerics', 'flux-limiter', '')
+        rs = ini_get(secs, 'MOSE-Numerics', 'riemann-solver', 'HLLC')
+        rec = ini_get(secs, 'MOSE-Numerics', 'space-reconstruction', '')
+        tsch = ini_get(secs, 'MOSE-Numerics', 'time-scheme', '')
+        note['scheme'] = 'time-scheme %s, %s, flux-limiter %s, Riemann %s' % (tsch or '(missing)', rec or '(missing)', lim or '(missing)', rs)
+        if rec not in ('MUSCL', 'first-order'):
+            err('[MOSE-Numerics] space-reconstruction = %s: MUSCL or first-order' % (rec or '(missing, required)'))
+        if rec != 'first-order' and lim.lower() not in ('minmod', 'vanleer', 'vanalbada', 'mc', 'superbee'):
+            err('[MOSE-Numerics] flux-limiter = %s: the GPU has minmod, vanleer, vanalbada, mc and superbee' % (lim or '(missing, required)'))
+        if rs == 'HLLC-PC' and ini_get(secs, 'MOSE-Numerics', 'integration-variables', 'cons') != 'prec':
+            err('[MOSE-Numerics] riemann-solver = HLLC-PC: integration-variables must be set to prec (as MOSE_open)')
+        elif rs not in ('HLLC', 'HLLE', 'SLAU', 'AUSM+', 'AUSM+M', 'HLLE++', 'HLLC+Tramel', 'LLF', 'Rusanov', 'SLAU2', 'HLLC+Chen',
+                      'exact', 'LMRoe', 'MiczekRoe', 'HLLC-PC'):
+            err('[MOSE-Numerics] riemann-solver = %s: riemann-solver must be one of: HLLC, HLLC+Tramel, HLLC+Chen, HLLC-PC, '
+                'HLLE, HLLE++, SLAU, SLAU2, LMRoe, MiczekRoe, AUSM+, AUSM+M, LLF, Rusanov, exact (as MOSE_open)' % rs)
+        if rs in ('AUSM+M', 'HLLC+Chen', 'LMRoe'):
+            try:
+                if float(ini_get(secs, 'MOSE-Numerics', 'riemann-options-Mco', '0')) <= 0.0:
+                    err('[MOSE-Numerics] riemann-solver = %s needs riemann-options-Mco > 0 (as MOSE_open)' % rs)
+            except ValueError:
+                err('[MOSE-Numerics] riemann-options-Mco is not a number')
+        if tsch not in ('euler', 'RK2', 'RK3'):
+            err('[MOSE-Numerics] time-scheme = %s: euler, RK2 or RK3 (required)' % (tsch or '(missing)'))
+        sdk = (ini_get(secs, 'MOSE-Numerics', 'shock-detector') or '').lower()
+        if sdk not in ('', 'tramel', 'chen'):
+            err('[MOSE-Numerics] shock-detector = %s: Tramel or Chen (as MOSE_open)' % sdk)
+        iv = ini_get(secs, 'MOSE-Numerics', 'integration-variables', 'cons')
+        if iv not in ('cons', 'prim', 'prec'):
+            err('[MOSE-Numerics] integration-variables = %s: cons, prim or prec' % iv)
+        # irs = true or irs-beta > 0 (MOSE_open: smoothing on) is translated to [MOSE-scheme] IRS/beta: device Mod_IRS_W,
+        # one rank (the code stops otherwise)
+        try:
+            if int(ini_get(secs, 'MOSE-Multigrid', 'levels', '1')) > 1:
+                err('[MOSE-Multigrid] levels > 1: multigrid is not on the GPU')
+        except ValueError:
+            pass
+        for k, what in (('soot-generation', 'soot'),):
+            v = ini_get(secs, 'MOSE-Physics', k)
+            if v is not None and v not in ('none', '0', '0.0', '0.d0', '0d0'):
+                err('[MOSE-Physics] %s = %s: %s is not on the GPU' % (k, v, what))
+        if ini_get(secs, 'MOSE-Turbulence', 'omega-wall-bc', 'practical') not in ('practical', 'asymptotic'):
+            err('[MOSE-Turbulence] omega-wall-bc = %s: practical or asymptotic' % ini_get(secs, 'MOSE-Turbulence', 'omega-wall-bc'))
+        if ini_get(secs, 'MOSE-Turbulence', 'sst-production', 'incompressible') not in ('incompressible', 'compressible'):
+            err('[MOSE-Turbulence] sst-production = %s: incompressible or compressible' % ini_get(secs, 'MOSE-Turbulence', 'sst-production'))
+        try:   # translated into [MOSE-RANS] k-coupling by IO_Ini_Open (k in the total energy): only its form is checked
+            as_logical(ini_get(secs, 'MOSE-Turbulence', 'k-energy-coupling', 'false'))
+        except ValueError:
+            err('[MOSE-Turbulence] k-energy-coupling is not a logical')
+        if ini_get(secs, 'MOSE-Numerics', 'cfl') is None:
+            err('[MOSE-Numerics] cfl missing: required')
+        if ini_get(secs, 'MOSE-Numerics', 'time-accurate') is None:
+            err('[MOSE-Numerics] time-accurate missing: required')
+        elif iv == 'prec':
+            try:
+                if as_logical(ini_get(secs, 'MOSE-Numerics', 'time-accurate')):
+                    err('[MOSE-Numerics] integration-variables=prec is currently supported only for steady/pseudo-time runs '
+                        '(time-accurate = false; as MOSE_open)')
+            except ValueError:
+                err('[MOSE-Numerics] time-accurate is not a logical')
+    else:
+        lim = ini_get(secs, 'MOSE-scheme', 'limiter', 'IORD')
+        rs = ini_get(secs, 'MOSE-scheme', 'riemann', 'HLLC Batten')
+        note['scheme'] = 'limiter %s, Riemann %s' % (lim, rs)
+        if lim not in GPU_LIMITERS:
+            err('[MOSE-scheme] limiter = %s: the GPU has MINMOD, VANLEER, VANALBADA, MC, SUPERBEE and IORD (first order)' % lim)
+        if rs not in GPU_RIEMANN:
+            err('[MOSE-scheme] riemann = %s: not a solver of the GPU (those of MOSE_open)' % rs)
+        if rs in ('AUSM+M', 'HLLC+Chen', 'LMRoe'):
+            try:
+                if float(ini_get(secs, 'MOSE-scheme', 'riemann-options-Mco', '0')) <= 0.0:
+                    err('[MOSE-scheme] riemann = %s needs riemann-options-Mco > 0 (as MOSE_open)' % rs)
+            except ValueError:
+                err('[MOSE-scheme] riemann-options-Mco is not a number')
+        if ini_get(secs, 'MOSE-parameters', 'cfl') is None and ini_get(secs, 'MOSE-parameters', 'CFL') is None:
+            err('[MOSE-parameters] cfl missing: the code stops without it')
+
+    # laminar diffusion: schmidt <= 0 = mixture-averaged multicomponent (DIFF_MC), table needed
+    sc = ini_get(secs, 'MOSE-Physics', 'schmidt')
+    if sc is None and opn and has_rans and (c['nsc'] or 0) > 1:
+        sc = '0.0'   # the MOSE_open default the code applies (IO_Ini_Open.f90)
+    if (c['nsc'] or 0) == 1 and sc is None:
+        note['diffusion'] = 'single species: no species diffusion'
+    elif sc is None:
+        note['diffusion'] = 'Schmidt number %s  ([MOSE-RANS] Sc%s; MOSE_open would default to multicomponent)' % (
+            ini_get(secs, 'MOSE-RANS', 'Sc', '0.7'), '' if ini_get(secs, 'MOSE-RANS', 'Sc') else ', default')
+    else:
+        try:
+            scv = float(sc.replace('d', 'e').replace('D', 'e'))
+        except ValueError:
+            scv = None
+            err('[MOSE-Physics] schmidt = %s is not a number' % sc)
+        if scv is not None and scv <= 0:
+            has = any(os.path.exists(os.path.join(case, 'INPUT', 'diffusion' + e)) for e in ('.dat', '.szplt'))
+            note['diffusion'] = 'multicomponent (schmidt = %s)%s' % (sc, '' if has else '  TABLE MISSING')
+            if not has:
+                err('schmidt <= 0 (multicomponent diffusion) needs INPUT/diffusion.dat or .szplt')
+        elif scv is not None:
+            note['diffusion'] = 'Schmidt number %s' % sc
+
+    # restart: newrun = false reads OUTPUT/field.*
+    nr = ini_get(secs, 'MOSE-Parameters', 'newrun') if opn else ini_get(secs, 'MOSE-parameters', 'newrun')
+    if nr is None and ini_get(secs, 'MOSE-parameters', 'restart') is not None:
+        try:
+            nr = 'f' if as_logical(ini_get(secs, 'MOSE-parameters', 'restart')) else 't'
+        except ValueError:
+            nr = None
+    try:
+        newrun = True if nr is None else as_logical(nr)
+    except ValueError:
+        newrun = True
+        err('[MOSE-parameters] newrun = %s is not a logical' % nr)
+    if newrun:
+        # IO_Solution: INPUT/ic.tec (tecplot ascii, default), ic.szplt (tecplot binary), ic.bin (native), ic.vtm (vtk)
+        fmt = (ini_get(secs, 'MOSE-IO', 'ic-format' if opn else 'ini-format', 'tecplot ascii') or 'tecplot ascii').split()
+        ext = {'native': '.bin', 'vtk': '.vtm'}.get(fmt[0], '.tec' if len(fmt) < 2 or fmt[1] == 'ascii' else '.szplt')
+        note['start'] = 'new run from INPUT/ic%s' % ext
+        if not os.path.exists(os.path.join(case, 'INPUT', 'ic' + ext)):
+            err('INPUT/ic%s missing: the initial field of a new run (%s)' % (ext, ' '.join(fmt)))
+    else:
+        out = os.path.join(case, 'OUTPUT')
+        fields = [f for f in ('field.tec', 'field.szplt', 'field.plt') if os.path.exists(os.path.join(out, f))]
+        note['start'] = 'restart from OUTPUT/%s' % (fields[0] if fields else '?')
+        if not fields:
+            err('newrun = false but no OUTPUT/field.tec or field.szplt to restart from')
+
+    # block -> rank map
+    own = os.path.join(case, 'INPUT', 'block_owner.txt')
+    c['ranks'] = None
+    if os.path.isfile(own):
+        try:
+            with open(own) as f:
+                ranks = [int(x) for x in f.read().split()]
+            c['ranks'] = max(ranks) + 1
+            note['ranks'] = '%d  (INPUT/block_owner.txt, %d blocks)' % (c['ranks'], len(ranks))
+        except ValueError:
+            err('INPUT/block_owner.txt is not one integer per block')
+
+    check_keys(secs, src, warn, err)
+    return c
+
+
+OBSOLETE_CALL = re.compile(r"(mr|jimp)_obsolete_keys\s*\(\s*fini\s*,[^\[]*\[character\(len=\d+\)\s*::(.*?)\]"
+                           r"\s*(?:,\s*&?\s*repl\s*=\s*'([^']*)')?", re.S)
+
+
+def known_keys(src):
+    """Sections and keys the GPU code reads, and the keys it rejects, taken from the source tree itself (so the
+    lists never go stale). Obsolete keys: mr_obsolete_keys with repl= and every jimp_obsolete_keys stop the run."""
+    keys, sects, obsolete = set(), set(['MOSE-nochem']), {}
+    for top in ('src', os.path.join('lib', 'FLINT', 'src', 'lib')):
+        for root, _, files in os.walk(os.path.join(src, top)):
+            for fn in files:
+                if not fn.lower().endswith(('.f90', '.inc')):
+                    continue
+                with open(os.path.join(root, fn), errors='replace') as f:
+                    s = f.read()
+                keys.update(re.findall(r"option_name\s*=\s*'([^']+)'", s))
+                sects.update('MOSE' + m for m in re.findall(r"codename\)\s*//\s*'(-[A-Za-z0-9_-]+)'", s))
+                for fam, lst, repl in OBSOLETE_CALL.findall(s):
+                    if fam == 'jimp':
+                        repl = 'omega-source-relax = t | f'
+                    for k in re.findall(r"'([^']+)'", lst):
+                        obsolete[k] = repl or None
+    return sects, keys, obsolete
+
+
+def check_keys(secs, src, warn, err):
+    """Stop on keys the binary rejects; warn on [MOSE-*] sections and keys the GPU code never reads (it would
+    silently use its defaults). In the MOSE_open dialect the keys the code translates at start-up are fine."""
+    if not os.path.isdir(os.path.join(src, 'src')):
+        return
+    sects, keys, obsolete = known_keys(src)
+    opn = is_open_dialect(secs)
+    for sec, opts in secs.items():
+        if not sec.startswith('MOSE-'):
+            continue   # ATLAS sections (GPB/ICB/BCB/GRIB), probe and material sections
+        if opn and sec in OPEN_TRANSLATED:
+            for k in opts:
+                if k in OPEN_TRANSLATED[sec] or (sec == 'MOSE-IO' and k in keys) or \
+                   (sec == 'MOSE-Multigrid' and re.match(r'level\d+-iter$', k)) or \
+                   (sec == 'MOSE-Rotating-Frame' and k.startswith('stationary-face-')):
+                    continue
+                warn('[%s] %s is not read by the GPU code nor translated: the line has no effect' % (sec, k))
+            continue
+        if opn and sec == 'MOSE-Probes':
+            continue
+        if sec not in sects:
+            hint = OPEN_SECTIONS.get(sec)
+            if hint:
+                warn('[%s] is not read by the GPU code: use %s' % (sec, hint))
+                continue
+        for k in opts:
+            if k in obsolete and sec == 'MOSE-scheme':
+                if obsolete[k]:
+                    err('[%s] %s no longer exists and the binary stops on it: use %s' % (sec, k, obsolete[k]))
+                else:
+                    warn('[%s] %s no longer exists (its production value is built in): delete the line' % (sec, k))
+                continue
+            if sec == 'MOSE-probes' or (sec in sects and k in keys):
+                continue
+            hint = OPEN_KEYS.get((sec, k))
+            if hint:
+                warn('[%s] %s is not read by the GPU code: use %s' % (sec, k, hint))
+            else:
+                warn('[%s] %s is not read by the GPU code: the line has no effect' % (sec, k))
+
+
+# ---------------------------------------------------------------------------------------------------- the source
+def run(cmd, cwd=None, check=False):
+    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and p.returncode != 0:
+        raise Fail('%s failed: %s' % (' '.join(cmd), p.stderr.decode(errors='replace').strip()))
+    return p.returncode, p.stdout
+
+
+def own_repo(path):
+    rc, out = run(['git', '-C', path, 'rev-parse', '--show-toplevel'])
+    return rc == 0 and os.path.realpath(out.decode().strip()) == os.path.realpath(path)
+
+
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for blk in iter(lambda: f.read(1 << 20), b''):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def entry_digest(path):
+    """A symlink by its target (rsync -a copies it as a link), a file by its content, a folder by its entries."""
+    if os.path.islink(path):
+        return 'L' + os.readlink(path)
+    if os.path.isfile(path):
+        return 'F' + file_md5(path)
+    h = hashlib.md5()
+    for root, dirs, files in os.walk(path):
+        keep = []
+        for d in sorted(dirs):
+            if d == '.git' or d.startswith('build'):
+                continue
+            if os.path.islink(os.path.join(root, d)):
+                files.append(d)          # a linked folder counts by its target, like a linked file
+            else:
+                keep.append(d)
+        dirs[:] = keep
+        for fn in sorted(files):
+            p = os.path.join(root, fn)
+            h.update(os.path.relpath(p, path).encode() + entry_digest(p).encode())
+    return 'D' + h.hexdigest()
+
+
+def source_state(src, recipe):
+    """Fingerprint of everything the build compiles: per git tree its HEAD, its diff and its untracked files;
+    for a populated folder that is not a git tree of its own (OSlo), the content of its files."""
+    h, dirty, heads = hashlib.md5(), False, OrderedDict()
+    h.update(' '.join(recipe).encode() + NVHPC.encode())
+    for sub in ('.',) + SUBTREES:
+        path = os.path.normpath(os.path.join(src, sub))
+        if sub != '.' and (not os.path.isdir(path) or not os.listdir(path)):
+            raise Fail('%s is not checked out in %s (git submodule update --init, or point MOSE_SRC at a full tree)' % (sub, src))
+        h.update(sub.encode())
+        if own_repo(path):
+            _, head = run(['git', '-C', path, 'rev-parse', 'HEAD'], check=True)
+            paths = list(BUILD_PATHS) if sub == '.' else ['.']
+            _, diff = run(['git', '-C', path, 'diff', 'HEAD', '--binary', '--'] + paths, check=True)
+            _, unt = run(['git', '-C', path, 'ls-files', '--others', '--exclude-standard', '-z', '--'] + paths, check=True)
+            h.update(head + diff)
+            for u in sorted(x for x in unt.decode().split('\0') if x):
+                h.update(u.encode() + entry_digest(os.path.join(path, u.rstrip('/'))).encode())
+            dirty = dirty or bool(diff.strip() or unt.strip())
+            heads[sub] = head.decode().strip()[:7]
+        else:
+            h.update(entry_digest(path).encode())
+            heads[sub] = 'files'
+    return {'fp': h.hexdigest()[:8], 'dirty': dirty, 'heads': heads}
+
+
+def recipe_for(c):
+    r = RECIPE + ['--nsc=%d' % c['nsc'], '--nrans=%d' % c['nrans']]
+    return r + (['--ode-rodas'] if c['ode'] == 'rodas' else [])
+
+
+def build_key(c, st):
+    return 'nsc%d-nrans%d-%s-%s-%s' % (c['nsc'], c['nrans'], c['ode'], st['heads']['.'], st['fp'])
+
+
+# ---------------------------------------------------------------------------------------------------- slurm
+def slurm(cmd):
+    exe = shutil.which(cmd) or os.path.join(SLURM_FALLBACK, cmd)
+    if not os.path.isfile(exe):
+        raise Fail('%s not found (load the slurm module)' % cmd)
+    return exe
+
+
+def sbatch(script, extra=()):
+    p = subprocess.run([slurm('sbatch'), '--parsable'] + list(extra) + [script],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if p.returncode != 0:
+        raise Fail('sbatch %s: %s' % (script, p.stderr.strip()))
+    return p.stdout.strip().split(';')[0]
+
+
+def job_alive(jid):
+    p = subprocess.run([slurm('squeue'), '-h', '-j', jid, '-o', '%T'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    return p.returncode == 0 and p.stdout.strip() != ''
+
+
+BUILD_SBATCH = """#!/bin/bash -l
+#SBATCH --partition={part} --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=48G --time=01:30:00
+#SBATCH --job-name=mose_build --output={bdir}/build.log
+# Written by mose: the certified GPU recipe for {key}, built in a private copy of the source taken at submit time.
+module purge   # a clean environment: another MPI loaded by the login shell would be found by the TecIO configure
+module load nvidia/nvhpc/24.11; module load nvidia/cuda-12.6.2 > /dev/null 2>&1
+export GIT_CEILING_DIRECTORIES={bdir}   # the copy has no .git: install.sh's git calls must not climb out of it
+cd {bdir}/src || exit 1
+t0=$(date +%s)
+./install.sh build {recipe} --build-dir={bdir}/src/build --jobs=12 || {{ echo MOSE_BUILD_FAILED; exit 1; }}
+[ -x bin/MOSE ] || {{ echo "MOSE_BUILD_FAILED: no bin/MOSE"; exit 1; }}
+echo "build wall $(( $(date +%s) - t0 )) s"
+grep -E '^(MOSE_NSC|MOSE_NRANS|MOSE_ODE_RODAS|OPENACC_GPU_OPTS|CMAKE_Fortran_FLAGS):' build/CMakeCache.txt | tee -a ../build.info
+cp mose_bind.sh ../mose_bind.sh && chmod 555 ../mose_bind.sh
+cp bin/MOSE ../MOSE.part && chmod 555 ../MOSE.part && mv -n ../MOSE.part ../MOSE; rm -f ../MOSE.part
+echo "binary md5 $(md5sum < ../MOSE | cut -c1-8)  built $(date '+%F %T') job $SLURM_JOB_ID" | tee -a ../build.info
+cd .. && rm -rf src build.jobid
+echo MOSE_BUILD_DONE
+"""
+
+RUN_SBATCH = """#!/bin/bash -l
+#SBATCH --partition={part} --nodes=1 --ntasks={n} --cpus-per-task={cpt} --gres=gpu:tesla:{gpus} --mem={mem} --time={time}
+#SBATCH --job-name={name} --output={case}/mose_%j.out{nodelist}
+# Written by mose {date}: binary {key}
+module load nvidia/nvhpc/24.11
+MPIRUN={nvhpc}/comm_libs/mpi/bin/mpirun
+export OMP_NUM_THREADS=1 NV_ACC_CUDA_HEAPSIZE=512M; ulimit -s unlimited
+B={bdir}
+cd {case} || exit 1; mkdir -p OUTPUT
+[ -x $B/MOSE ] || {{ echo "[mose] no binary in $B: its build failed, see $B/build.log"; exit 1; }}
+echo "[mose] binary $B/MOSE  md5 $(md5sum < $B/MOSE | cut -c1-8)  node $(hostname)  $(date)"
+echo "[mose] source $(grep -E '^(commits|modified) ' $B/build.info | paste -sd ' ')"
+t0=$(date +%s); $MPIRUN -n {n} --bind-to none $B/mose_bind.sh $B/MOSE; rc=$?
+echo "[mose] end $(date) rc=$rc wall $(( $(date +%s) - t0 )) s"
+exit $rc
+"""
+
+
+def ensure_binary(c, st, args):
+    """The binary of this key: already built (no dependency), being built (its job id), or a new build job."""
+    key = build_key(c, st)
+    bdir = os.path.join(args.builds, key)
+    os.makedirs(args.builds, exist_ok=True)
+    with open(os.path.join(args.builds, key + '.lock'), 'w') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)       # one build per key, however many submits run at once
+        if os.path.isfile(os.path.join(bdir, 'MOSE')):
+            return key, bdir, None
+        jf = os.path.join(bdir, 'build.jobid')
+        if os.path.isfile(jf):
+            with open(jf) as f:
+                jid = f.read().strip()
+            if jid and job_alive(jid):
+                return key, bdir, jid
+            log = os.path.join(bdir, 'build.log')
+            print('  previous build (job %s) left no binary; its log ends with:' % jid)
+            if os.path.isfile(log):
+                with open(log, errors='replace') as f:
+                    for line in f.read().splitlines()[-8:]:
+                        print('    ' + line)
+                os.replace(log, log + '.failed-' + jid)
+            print('  building again')
+        if args.dry_run:
+            return key, bdir, 'DRYRUN'
+        print('  copying the source for the build (a minute on /scratch) ...', flush=True)
+        shutil.rmtree(os.path.join(bdir, 'src'), ignore_errors=True)
+        os.makedirs(bdir, exist_ok=True)
+        rs = ['rsync', '-a', '--delete'] + ['--exclude=%s' % e for e in SNAPSHOT_EXCLUDES]
+        run(rs + [args.src.rstrip('/') + '/', os.path.join(bdir, 'src') + '/'], check=True)
+        if source_state(args.src, recipe_for(c))['fp'] != st['fp']:
+            shutil.rmtree(os.path.join(bdir, 'src'), ignore_errors=True)
+            raise Fail('the source changed while it was being copied: run the command again')
+        with open(os.path.join(bdir, 'build.info'), 'w') as f:
+            f.write('key %s\nsource %s\ncommits %s\nmodified %s\nrecipe install.sh build %s\nsubmitted %s by %s\n'
+                    % (key, os.path.realpath(args.src), ' '.join('%s=%s' % kv for kv in st['heads'].items()),
+                       'yes' if st['dirty'] else 'no', ' '.join(recipe_for(c)), time.strftime('%F %T'),
+                       os.environ.get('USER', '?')))
+        script = os.path.join(bdir, 'build.sbatch')
+        with open(script, 'w') as f:
+            f.write(BUILD_SBATCH.format(part=args.build_partition, bdir=bdir, key=key, recipe=' '.join(recipe_for(c))))
+        jid = sbatch(script)
+        with open(jf, 'w') as f:
+            f.write(jid + '\n')
+        return key, bdir, jid
+
+
+# ---------------------------------------------------------------------------------------------------- commands
+def report(c, st=None, key=None, args=None):
+    print('case        %s' % c['case'])
+    for k, v in c['notes'].items():
+        print('%-11s %s' % (k, v))
+    if key:
+        built = os.path.isfile(os.path.join(args.builds, key, 'MOSE'))
+        print('binary      %s  [%s]' % (key, 'built' if built else 'to build'))
+        print('source      %s  (%s%s)' % (os.path.realpath(args.src), ' '.join('%s=%s' % kv for kv in st['heads'].items()),
+                                         ', modified' if st['dirty'] else ''))
+    for w in c['warnings']:
+        print('warning     ' + w)
+    for e in c['errors']:
+        print('ERROR       ' + e)
+
+
+def prepare(args):
+    case = os.path.realpath(args.case)
+    c = read_case(case, args.src)
+    st = key = None
+    if c['nsc'] is not None:
+        st = source_state(args.src, recipe_for(c))
+        key = build_key(c, st)
+    report(c, st, key, args)
+    return c, st, key
+
+
+def cmd_check(args):
+    c, _, _ = prepare(args)
+    print('-> %s' % ('ready for the GPU' if not c['errors'] else '%d error(s): fix them before submitting' % len(c['errors'])))
+    return 1 if c['errors'] else 0
+
+
+def cmd_build(args):
+    c, st, _ = prepare(args)
+    if c['errors']:
+        print('-> not built: fix the errors above')
+        return 1
+    key, bdir, jid = ensure_binary(c, st, args)
+    if jid is None:
+        print('-> binary ready: %s/MOSE' % bdir)
+    elif jid == 'DRYRUN':
+        print('-> dry run: a build job would make %s/MOSE' % bdir)
+    else:
+        print('-> build job %s -> %s/MOSE' % (jid, bdir))
+    return 0
+
+
+def cmd_submit(args):
+    c, st, _ = prepare(args)
+    n = args.ntasks or c['ranks'] or 1
+    if c['ranks'] is not None and n != c['ranks']:
+        c['errors'].append('-n %d but INPUT/block_owner.txt uses ranks 0..%d: submit with -n %d' % (n, c['ranks'] - 1, c['ranks']))
+        print('ERROR       ' + c['errors'][-1])
+    if c['errors']:
+        print('-> not submitted: fix the errors above')
+        return 1
+    key, bdir, dep = ensure_binary(c, st, args)
+    nodelist = '\n#SBATCH --nodelist=%s' % args.nodelist if args.nodelist else ''
+    text = RUN_SBATCH.format(part=args.partition, n=n, cpt=args.cpus_per_task, gpus=args.gpus or n, mem=args.mem,
+                             time=args.time, name=args.name or os.path.basename(c['case'])[:24], case=c['case'],
+                             nodelist=nodelist, date=time.strftime('%F %T'), key=key, nvhpc=NVHPC, bdir=bdir)
+    script = os.path.join(c['case'], 'mose_run.sbatch')
+    if args.dry_run:
+        print('-> dry run: %s, then the run script below (not written)\n' %
+              ('binary ready' if dep is None else 'a build job'))
+        print(text)
+        return 0
+    with open(script, 'w') as f:
+        f.write(text)
+    jid = sbatch(script, ['--dependency=afterok:%s' % dep] if dep else [])
+    if dep:
+        print('-> build job %s (binary %s), run job %s starts after it' % (dep, key, jid))
+    else:
+        print('-> run job %s (binary %s), log %s/mose_%s.out' % (jid, key, c['case'], jid))
+    return 0
+
+
+def cmd_list(args):
+    if not os.path.isdir(args.builds):
+        print('no builds in %s' % args.builds)
+        return 0
+    for key in sorted(os.listdir(args.builds)):
+        d = os.path.join(args.builds, key)
+        if not os.path.isdir(d):
+            continue
+        state = 'built' if os.path.isfile(os.path.join(d, 'MOSE')) else 'building or failed'
+        info = ''
+        if os.path.isfile(os.path.join(d, 'build.info')):
+            with open(os.path.join(d, 'build.info')) as f:
+                info = ' | '.join(l.strip() for l in f if l.startswith(('submitted', 'binary md5', 'modified')))
+        print('%-48s %-18s %s' % (key, state, info))
+    return 0
+
+
+def cmd_example(args):
+    path = os.path.join(HERE, 'docs', 'user', 'input.gpu.example.ini')
+    if not os.path.isfile(path):
+        raise Fail('%s not found' % path)
+    with open(path) as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='mose', description=__doc__.split('\n')[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n', 2)[2])
+    ap.add_argument('--src', default=os.environ.get('MOSE_SRC', HERE), help='source tree to build (default: this tree)')
+    ap.add_argument('--builds', default=os.environ.get('MOSE_BUILDS', os.path.join('/scratch', os.environ.get('USER', 'user'), 'mose_builds')))
+    ap.add_argument('--build-partition', default=os.environ.get('MOSE_BUILD_PARTITION', 'free'))
+    sub = ap.add_subparsers(dest='cmd')
+    for name in ('check', 'build', 'submit'):
+        p = sub.add_parser(name)
+        p.add_argument('case', nargs='?', default='.')
+        p.add_argument('--dry-run', action='store_true', help='show what would be done, submit nothing')
+        if name == 'submit':
+            p.add_argument('-n', '--ntasks', type=int, help='MPI ranks (default: the ranks of INPUT/block_owner.txt, else 1)')
+            p.add_argument('--gpus', type=int, help='GPUs (default: one per rank)')
+            p.add_argument('-p', '--partition', default='fatgpu')
+            p.add_argument('-t', '--time', default='02:00:00')
+            p.add_argument('-J', '--name')
+            p.add_argument('--mem', default='100G')
+            p.add_argument('--cpus-per-task', type=int, default=8)
+            p.add_argument('--nodelist')
+    sub.add_parser('list')
+    sub.add_parser('example')
+    args = ap.parse_args()
+    args.src = os.path.realpath(args.src)
+    try:
+        if args.cmd is None:
+            ap.print_help()
+            return 1
+        return {'check': cmd_check, 'build': cmd_build, 'submit': cmd_submit,
+                'list': cmd_list, 'example': cmd_example}[args.cmd](args)
+    except Fail as e:
+        print('mose: %s' % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

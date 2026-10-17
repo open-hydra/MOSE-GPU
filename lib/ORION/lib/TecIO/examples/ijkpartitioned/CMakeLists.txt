@@ -1,0 +1,6 @@
+add_executable(ijkpartitioned "ijkpartitioned.cpp")
+if (WIN32)
+    target_link_libraries(ijkpartitioned tecio)
+else ()
+    target_link_libraries(ijkpartitioned tecio pthread)
+endif ()

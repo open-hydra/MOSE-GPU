@@ -1,0 +1,86 @@
+MODULE FLINT_CEA_data
+
+!***********************************************************************
+! FUNDAMENTAL CONSTANTS FROM:  COHEN,E.RICHARD & TAYLOR,BARRY N.,
+! THE 1986 CODATA RECOMMENDED VALUES OF THE FUNDAMENTAL PHYSICAL
+! CONSTANTS, J.PHYS.CHEM.REF.DATA, VOL.17, NO.4, 1988, PP 1795-1803.
+!***********************************************************************
+
+  IMPLICIT NONE
+
+  ! Define module constants using PARAMETER
+  INTEGER, PARAMETER :: MAXNGC = 200
+  INTEGER, PARAMETER :: MAXNC = 0
+  INTEGER, PARAMETER :: NCOL = 8
+  INTEGER, PARAMETER :: MAXMAT = 50
+  INTEGER, PARAMETER :: MAXTR = 30
+  INTEGER, PARAMETER :: MAXR = 24
+  INTEGER, PARAMETER :: MAXEL = 20
+
+  REAL(8) :: Deln(MAXNGC), Sln(MAXNGC)
+
+  INTEGER :: Ip, Iplt, It, Nc, Ng, Ngp1, Nlm, Nomit, Nonly, Np, Npr, Npt
+  INTEGER :: Ngc, Nspx, Nt
+  INTEGER :: Jcond(45), Jx(MAXEL), Ifz(MAXNC)
+
+  REAL(8) :: Bcheck
+
+  CHARACTER(2), PARAMETER :: Symbol(100) = ['H ','D ','HE','LI','BE','B ','C ','N ','O ','F ', &
+          'NE','NA','MG','AL','SI','P ','S ','CL','AR','K ','CA','SC', &
+          'TI','V ','CR','MN','FE','CO','NI','CU','ZN','GA','GE','AS', &
+          'SE','BR','KR','RB','SR','Y ','ZR','NB','MO','TC','RU','RH', &
+          'PD','AG','CD','IN','SN','SB','TE','I ','XE','CS','BA','LA', &
+          'CE','PR','ND','PM','SM','EU','GD','TB','DY','HO','ER','TM', &
+          'YB','LU','HF','TA','W ','RE','OS','IR','PT','AU','HG','TL', &
+          'PB','BI','PO','AT','RN','FR','RA','AC','TH','PA','U ','NP', &
+          'PU','AM','CM','BK','CF','ES']
+  ! ATOMIC WEIGHTS - Coplen,T.B., Atomic Weights of the Elements 1999. 
+  !   J.Phys.Chem.Ref.Data, vol.30, no.3, 2001, pp.701-712.
+  REAL(8), PARAMETER :: Atmwt(100) = [1.00794D0,2.014102D0,4.002602D0,6.941D0,&
+     9.012182D0,10.811D0,12.0107D0,14.0067D0,15.9994D0,18.9984032D0,&
+     20.1797D0,22.989770D0,24.305D0,26.981538D0,28.0855D0,30.973761D0,&
+     32.065D0,35.453D0,39.948D0,39.0983D0,40.078D0,44.95591D0,&
+     47.867D0, 50.9415D0,51.9961D0,54.938049D0,&
+     55.845D0,58.933200D0,58.6934D0,63.546D0,65.39D0,69.723D0,72.64D0,&
+     74.92160D0,78.96D0,79.904D0,83.80D0,85.4678D0,87.62D0,88.90585D0,&
+     91.224D0,92.90638D0,95.94D0,97.9072D0,101.07D0,102.9055D0,&
+     106.42D0,&
+     107.8682D0,112.411D0,114.818D0,118.710D0, 121.760D0,127.6D0,&
+     126.90447D0,131.293D0,132.90545D0,137.327D0,138.9055D0,140.116D0,&
+     140.90765D0,144.9127D0,145.D0,150.36D0,151.964D0,157.25D0,&
+     158.92534D0,&
+     162.50D0,164.93032D0,167.259D0,168.93421D0,173.04D0,174.967D0,&
+     178.49D0,180.9479D0,183.84D0,186.207D0,190.23D0,192.217D0,&
+     195.078D0,196.96655D0,200.59D0,204.3833D0,207.2D0,208.98038D0,&
+     208.9824D0, 209.9871D0,&
+     222.0176D0,223.0197D0,226.0254D0,227.0278D0,232.0381D0,&
+     231.03588D0,238.02891D0,237.0482D0,244.0642D0,243.0614D0,&
+     247.0703D0,247.0703D0,251.0587D0,252.083D0]
+
+  INTEGER :: Imat, Iq1, Isv, Jliq, Jsol, Lsave, Msing
+
+  LOGICAL :: Hp, Ions, Massf, Pderiv, Short, Tp, Vol
+
+  REAL(8) :: R, Size, Trace
+  REAL(8), PARAMETER :: Rr=8314.46261815324D0,Pi=3.14159265D0  ! Rr = Runiv of FLINT_Lib_Thermodynamic (exact SI value)
+  REAL(8) :: Atwt(MAXEL), X(MAXMAT)
+  REAL(8) :: A(MAXEL, MAXNGC)
+
+  CHARACTER(2) :: Elmt(MAXEL)
+  CHARACTER(15) :: Prod(0:MAXNGC)
+
+  REAL(8) :: Cpr(NCOL), Dlvpt(NCOL), Dlvtp(NCOL), Hsum(NCOL), &
+             Ppp(NCOL), Ssum(NCOL), Totn(NCOL), Ttt(NCOL), Wm(NCOL)
+
+  INTEGER :: Nreac
+
+  REAL(8) :: Cpsum
+  REAL(8) :: Temp(2, MAXNC)
+  REAL(8) :: Mw(MAXNGC)
+
+  INTEGER :: Iopt, Npp
+
+  INTEGER :: Nm, Nr, Ntape
+  INTEGER :: Ind(MAXTR), Jcm(MAXEL)
+
+END MODULE FLINT_CEA_data
