@@ -1,5 +1,5 @@
 # md5 (first 8 hex digits) of OUTPUT/field.tec after one iteration of each test case of MOSE b29130b, staged by run_mose_tests.py
-# with --one-iteration; binaries built by install.sh build --production (V100 and A30 give the same bits).
+# with --one-iteration; binaries built by install.sh build --production (reproduced from a clean clone on V100 GPUs).
 1D_diff1                                      80569e2a
 1D_diff2                                      f5823888
 1D_Ein91                                      d27942d1

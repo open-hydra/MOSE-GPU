@@ -31,8 +31,8 @@ the `MOSE.sh` of each test links, the 1-D tests use the 400-cell grid, and the i
 solution use 64 × 64. The two shock / boundary-layer cases start from a field of the coarse grid levels that MOSE computes,
 since the GPU has no grid sequencing; they are staged only when `--swbli-seed` points to those fields.
 
-`test/reference_1it.md5` holds the reference table. It was made with binaries built by `install.sh build --production`,
-on V100 and A30, which give the same bits.
+`test/reference_1it.md5` holds the reference table. It was made with binaries built by `install.sh build --production`;
+the binaries of this release, built from a clean clone, reproduce it bit for bit on V100 GPUs.
 
 ## Comparison with MOSE
 
