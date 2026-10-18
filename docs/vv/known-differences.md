@@ -90,8 +90,9 @@ going through the angles. To be fixed in both codes.
 - **The value matters.** Setting `u2Roe` = 1e3 instead of the undefined value changes the field by 23 % on T.
 - **A large value.** Setting it to 1e6 stops the run at step 1.
 - **Control.** The same line in MiczekRoe, where `u2Roe` is assigned before use, leaves the field identical to the bit.
-- **Two builds.** The reference binary and the test copy without the switch are two builds of the same code. They differ
-  by 0.8 % on T after one step.
+- **Two binaries.** The reference binary and the test copy without the switch perform the same computation: on the Wilcox
+  flat plate they give the same bits. Here they differ by 0.8 % on T after one step: only what memory holds in place of
+  `u2Roe` changes.
 
 **Proposed fix.** `u2Roe = uRoe*uRoe + vRoe*vRoe + wRoe*wRoe` after `unRoe`. With that line in a test copy of MOSE, the two
 codes agree to 1e-14 on the vortex and 4e-10 at the Sod shock. MOSE-GPU assigns it so.
