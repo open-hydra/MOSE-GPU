@@ -5,16 +5,15 @@ This walkthrough runs the Sod shock tube of MOSE on a GPU and compares the resul
 ## 1. Take a MOSE test case
 
 MOSE-GPU reads the input files of MOSE as they are. The test cases of MOSE that run on the GPU are in `test/`, ready to
-run; `mose case` lists them and copies one to `/scratch/$USER`:
+run, at their path in MOSE. Copy one to `/scratch`, where the GPU nodes run:
 
 ```bash
-/path/to/MOSE-GPU/mose case Sod79
-cd /scratch/$USER/1D_Sod79
+cp -r /path/to/MOSE-GPU/test/1D/Sod79 /scratch/$USER/sod
+cd /scratch/$USER/sod
 ```
 
 The case holds `input.ini` and, in `INPUT/`, the 400-cell grid of the test together with the initial state (`ic.tec`),
-the boundary conditions (`bc.txt`) and the thermodynamics of air. `mose case` does not write over an existing folder: give
-another destination as second argument.
+the boundary conditions (`bc.txt`) and the thermodynamics of air.
 
 ## 2. Check the case
 

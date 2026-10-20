@@ -44,9 +44,9 @@ MPI rank. On the test cases of MOSE it gives the same results as MOSE.
 ```bash
 git clone --recurse-submodules https://github.com/open-hydra/MOSE-GPU.git
 
-# a test case of MOSE, copied to /scratch/$USER/1D_Sod79: build the binary it needs, then run it
-MOSE-GPU/mose case Sod79
-cd /scratch/$USER/1D_Sod79
+# a test case of MOSE, copied to /scratch: build the binary it needs, then run it
+cp -r MOSE-GPU/test/1D/Sod79 /scratch/$USER/sod
+cd /scratch/$USER/sod
 /path/to/MOSE-GPU/mose submit . -p <gpu partition>
 ```
 

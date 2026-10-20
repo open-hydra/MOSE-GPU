@@ -9,11 +9,11 @@ MOSE (`1D/Sod79`, `2D/euler/chang-nozzle`, ...), and the regression table.
 | `run_mose_tests.py` | stages the cases, submits them with `mose`, collects and compares md5 tables; `import` takes the cases from a MOSE checkout |
 | `reference_1it.md5` | the regression table: md5 of the field after one iteration of each case |
 
-To run one case, `mose case` copies it to `/scratch/$USER`:
+To run one case, copy its folder to `/scratch` and submit it:
 
 ```bash
-/path/to/MOSE-GPU/mose case Sod79
-cd /scratch/$USER/1D_Sod79 && /path/to/MOSE-GPU/mose submit . -p <gpu partition>
+cp -r /path/to/MOSE-GPU/test/1D/Sod79 /scratch/$USER/sod
+cd /scratch/$USER/sod && /path/to/MOSE-GPU/mose submit . -p <gpu partition>
 ```
 
 The regression table:
