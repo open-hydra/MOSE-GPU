@@ -12,11 +12,11 @@ reference table. One iteration is enough to touch every kernel a case uses: the 
 fluxes, the boundary fluxes, the sources and the update. The md5 changes if a single bit of the field changes. A
 refactoring or a performance change must leave the whole table unchanged.
 
-`test/run_mose_tests.py` stages the cases from a MOSE checkout, submits them with `mose`, and compares the md5:
+`test/run_mose_tests.py` stages the cases kept in `test/`, submits them with `mose`, and compares the md5:
 
 ```bash
-# stage the cases of MOSE b29130b, one iteration each
-python3 test/run_mose_tests.py stage --mose /path/to/MOSE --work /scratch/$USER/mose_tests --one-iteration
+# stage the cases, one iteration each
+python3 test/run_mose_tests.py stage --work /scratch/$USER/mose_tests --one-iteration
 
 # submit them: mose builds the binaries the cases need
 python3 test/run_mose_tests.py submit --work /scratch/$USER/mose_tests -p <gpu partition>
@@ -26,10 +26,16 @@ python3 test/run_mose_tests.py md5 --work /scratch/$USER/mose_tests > new.md5
 python3 test/run_mose_tests.py compare test/reference_1it.md5 new.md5
 ```
 
-The cases are staged as the validation of [Comparison with MOSE](../vv/mose-comparison.md) staged them. The files are those
-the `MOSE.sh` of each test links, the 1-D tests use the 400-cell grid, and the isentropic vortex and the manufactured
-solution use 64 × 64. The two shock / boundary-layer cases start from a field of the coarse grid levels that MOSE computes,
-since the GPU has no grid sequencing; they are staged only when `--swbli-seed` points to those fields.
+The cases in `test/` are those of MOSE b29130b, written by `run_mose_tests.py import` as the validation of
+[Comparison with MOSE](../vv/mose-comparison.md) staged them. The files are those the `MOSE.sh` of each test links, the 1-D
+tests use the 400-cell grid, and the isentropic vortex and the manufactured solution use 64 × 64; the fields and boundary
+files of the other grids are left out. The nozzles keep the cap of 5000 iterations of the validation, and
+pressure-centrifugal that of 2000. The two shock / boundary-layer cases are not kept in `test/`: they start from a field
+of the coarse grid levels that MOSE computes, since the GPU has no grid sequencing, and are staged from a MOSE checkout
+when `--mose /path/to/MOSE` and `--swbli-seed` are given.
+
+To take the cases of another MOSE commit, `python3 test/run_mose_tests.py import --mose /path/to/MOSE` writes them into
+`test/`; the reference table then has to be made again.
 
 `test/reference_1it.md5` holds the reference table. It was made with binaries built by `install.sh build --production`;
 the binaries of this release, built from a clean clone, reproduce it bit for bit on V100 GPUs.

@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """The regression table of MOSE-GPU on the test cases of MOSE.
 
-Stage the test cases of a MOSE checkout the way the validation against MOSE staged them, submit them with the `mose`
-launcher, collect the md5 of the final fields, and compare two tables.
+The test cases of MOSE that run on the GPU are kept in this folder, ready to run, at their path in test/ of MOSE
+(1D/Sod79, 2D/euler/chang-nozzle, ...). Stage them, submit them with the `mose` launcher, collect the md5 of the final
+fields, and compare two tables.
 
-  run_mose_tests.py stage   --mose MOSE --work WORK [--one-iteration] [--swbli-seed DIR] [TEST ...]
+  run_mose_tests.py stage   --work WORK [--one-iteration] [--mose MOSE --swbli-seed DIR] [TEST ...]
   run_mose_tests.py submit  --work WORK [-p PARTITION] [-t TIME] [--mem MEM] [TEST ...]
   run_mose_tests.py md5     --work WORK [TEST ...]
   run_mose_tests.py compare REFERENCE NEW
+  run_mose_tests.py import  --mose MOSE [TEST ...]
 
-TEST is a path under test/ of MOSE, e.g. 1D/Sod79, or its table name 1D_Sod79; by default the 23 cases of
+TEST is a path under test/, e.g. 1D/Sod79, or its table name 1D_Sod79; by default the 23 cases of
 test/reference_1it.md5.
 
-Staging, for every case: the files of INPUT/ and MESH/ of the MOSE test are linked, then the links the `solve` block of
-its MOSE.sh makes; input.ini is copied. As in the validation:
+stage copies the cases into WORK, one folder per table name. --one-iteration sets iter-threshold = 1: the regression
+table. swbli SA and SST are not kept here: MOSE-GPU has no grid sequencing, so the case restarts on the fine grid
+(levels = 1, newrun = false) from the field of the coarse levels computed by MOSE. They are staged from a MOSE checkout,
+--mose MOSE --swbli-seed DIR with DIR/SA/field.tec and DIR/SST/field.tec; SST also gets point-implicit = true. Without
+these two options the two cases are skipped.
+
+import writes the cases of a MOSE checkout into this folder (the copies here come from MOSE b29130b), the way the
+validation against MOSE staged them: the files of INPUT/ and MESH/ of the MOSE test, then those the `solve` block of its
+MOSE.sh links, as real files; input.ini without carriage returns. As in the validation:
   - Ein91, Noh87, Tor99: the 400-cell grid (ic_x4, bc_x4), like Sod79;
   - isentropic-vortex, mms: the 64 x 64 grid (ic-64, bc-64); mms runs without its manufactured source;
   - gresho-vortex: the solve argument 0.01 (Mach number);
-  - an iteration cap: 5000 for the nozzles, 2000 for pressure-centrifugal;
-  - swbli SA and SST: MOSE-GPU has no grid sequencing. The case restarts on the fine grid (levels = 1, newrun = false)
-    from the field of the coarse levels computed by MOSE: --swbli-seed DIR with DIR/SA/field.tec and DIR/SST/field.tec.
-    SST also gets point-implicit = true. Without --swbli-seed the two cases are skipped.
---one-iteration sets iter-threshold = 1: the regression table.
+  - an iteration cap: 5000 for the nozzles, 2000 for pressure-centrifugal.
+The initial fields and boundary files of the grids a case does not use (ic_x8.tec, bc-128.txt, ...) are left out.
 
 Python 3.6 or newer, standard library only.
 """
@@ -32,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MOSE_LAUNCHER = os.path.join(os.path.dirname(HERE), 'mose')
@@ -41,6 +48,8 @@ GRID_64 = ('2D/euler/isentropic-vortex', '2D/viscous/mms')
 CAPS = {'2D/euler/chang-nozzle': 5000, '2D/euler/rocket-nozzle/frozen': 5000, '3D/pressure-centrifugal': 2000}
 SOLVE_ARG = {'2D/euler/gresho-vortex': '0.01'}
 SWBLI = ('2D/viscous/swbli/SA', '2D/viscous/swbli/SST')
+GRID_VARIANT = re.compile(r'^(ic|bc)[-_].+\.(tec|txt)$')      # ic_x8.tec, bc-128.txt, ic-coarse.tec, ...
+RUN_FILES = shutil.ignore_patterns('OUTPUT', 'mose_*.out', 'mose_run.sbatch')
 
 
 def name_of(test):
@@ -142,52 +151,104 @@ def solve_links(src, dst, arg):
             link(target, os.path.join(dst, rel, b))
 
 
+def from_mose(t, src, dst, swbli_seed=None):
+    """Test t of MOSE (folder src) staged into dst as the validation staged it: links to the files of MOSE."""
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    for d in ('INPUT', 'MESH', 'OUTPUT'):
+        os.makedirs(os.path.join(dst, d))
+    for d in ('INPUT', 'MESH'):
+        sd = os.path.join(src, d)
+        if os.path.isdir(sd):
+            for f in sorted(os.listdir(sd)):
+                p = os.path.join(sd, f)
+                if os.path.isfile(p):
+                    link(os.path.realpath(p), os.path.join(dst, d, f))
+    solve_links(src, dst, SOLVE_ARG.get(t, ''))
+    if t in GRID_X4 or t in GRID_64:
+        tag = '_x4' if t in GRID_X4 else '-64'
+        link(os.path.realpath(os.path.join(src, 'INPUT', 'ic%s.tec' % tag)), os.path.join(dst, 'INPUT', 'ic.tec'))
+        link(os.path.realpath(os.path.join(src, 'INPUT', 'bc%s.txt' % tag)), os.path.join(dst, 'INPUT', 'bc.txt'))
+    ini = os.path.join(dst, 'input.ini')
+    open(ini, 'w').write(open(os.path.join(src, 'input.ini')).read().replace('\r', ''))
+    if t in CAPS:
+        old = get_key(ini, 'MOSE-Parameters', 'iter-threshold')
+        if not old or int(old) > CAPS[t]:
+            set_key(ini, 'MOSE-Parameters', 'iter-threshold', str(CAPS[t]))
+    if t in SWBLI:
+        seed = os.path.join(os.path.abspath(swbli_seed), os.path.basename(t), 'field.tec')
+        if not os.path.isfile(seed):
+            raise SystemExit('%s: no seed field %s' % (t, seed))
+        shutil.copy(seed, os.path.join(dst, 'OUTPUT', 'field.tec'))
+        set_key(ini, 'MOSE-Multigrid', 'levels', '1')
+        set_key(ini, 'MOSE-Parameters', 'newrun', 'false')
+        set_key(ini, 'MOSE-Parameters', 'iter-threshold', '20000')
+        if t.endswith('SST'):
+            set_key(ini, 'MOSE-Turbulence', 'point-implicit', 'true')
+
+
 def stage(args):
     tests = [test_path(t) for t in args.tests] if args.tests else list(TESTS)
-    root = os.path.join(os.path.abspath(args.mose), 'test')
     for t in tests:
-        src, dst = os.path.join(root, t), os.path.join(os.path.abspath(args.work), name_of(t))
-        if not os.path.isdir(src):
-            print('%-45s no such test in %s' % (t, root))
+        src, dst = os.path.join(HERE, t), os.path.join(os.path.abspath(args.work), name_of(t))
+        if os.path.isfile(os.path.join(src, 'input.ini')):
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, ignore=RUN_FILES)
+            for d in ('INPUT', 'MESH', 'OUTPUT'):
+                os.makedirs(os.path.join(dst, d), exist_ok=True)
+        elif t in SWBLI:
+            if not (args.mose and args.swbli_seed):
+                print('%-45s skipped: needs --mose and --swbli-seed' % t)
+                continue
+            src = os.path.join(os.path.abspath(args.mose), 'test', t)
+            if not os.path.isdir(src):
+                print('%-45s no such test in %s' % (t, os.path.dirname(src)))
+                continue
+            from_mose(t, src, dst, args.swbli_seed)
+        else:
+            print('%-45s no such case in %s' % (t, HERE))
             continue
-        if t in SWBLI and not args.swbli_seed:
-            print('%-45s skipped: needs --swbli-seed' % t)
-            continue
-        if os.path.isdir(dst):
-            shutil.rmtree(dst)
-        for d in ('INPUT', 'MESH', 'OUTPUT'):
-            os.makedirs(os.path.join(dst, d))
-        for d in ('INPUT', 'MESH'):
-            sd = os.path.join(src, d)
-            if os.path.isdir(sd):
-                for f in sorted(os.listdir(sd)):
-                    p = os.path.join(sd, f)
-                    if os.path.isfile(p):
-                        link(os.path.realpath(p), os.path.join(dst, d, f))
-        solve_links(src, dst, SOLVE_ARG.get(t, ''))
-        if t in GRID_X4 or t in GRID_64:
-            tag = '_x4' if t in GRID_X4 else '-64'
-            link(os.path.realpath(os.path.join(src, 'INPUT', 'ic%s.tec' % tag)), os.path.join(dst, 'INPUT', 'ic.tec'))
-            link(os.path.realpath(os.path.join(src, 'INPUT', 'bc%s.txt' % tag)), os.path.join(dst, 'INPUT', 'bc.txt'))
-        ini = os.path.join(dst, 'input.ini')
-        open(ini, 'w').write(open(os.path.join(src, 'input.ini')).read().replace('\r', ''))
-        if t in CAPS:
-            old = get_key(ini, 'MOSE-Parameters', 'iter-threshold')
-            if not old or int(old) > CAPS[t]:
-                set_key(ini, 'MOSE-Parameters', 'iter-threshold', str(CAPS[t]))
-        if t in SWBLI:
-            seed = os.path.join(os.path.abspath(args.swbli_seed), os.path.basename(t), 'field.tec')
-            if not os.path.isfile(seed):
-                raise SystemExit('%s: no seed field %s' % (t, seed))
-            shutil.copy(seed, os.path.join(dst, 'OUTPUT', 'field.tec'))
-            set_key(ini, 'MOSE-Multigrid', 'levels', '1')
-            set_key(ini, 'MOSE-Parameters', 'newrun', 'false')
-            set_key(ini, 'MOSE-Parameters', 'iter-threshold', '20000')
-            if t.endswith('SST'):
-                set_key(ini, 'MOSE-Turbulence', 'point-implicit', 'true')
         if args.one_iteration:
-            set_key(ini, 'MOSE-Parameters', 'iter-threshold', '1')
+            set_key(os.path.join(dst, 'input.ini'), 'MOSE-Parameters', 'iter-threshold', '1')
         print('%-45s staged' % t)
+
+
+def import_cases(args):
+    """The cases of a MOSE checkout written into this folder, with real files in place of the links of from_mose."""
+    tests = [test_path(t) for t in args.tests] if args.tests else [t for t in TESTS if t not in SWBLI]
+    root = os.path.join(os.path.abspath(args.mose), 'test')
+    tmp = tempfile.mkdtemp()
+    try:
+        for t in tests:
+            src = os.path.join(root, t)
+            if t in SWBLI:
+                print('%-45s not imported: staged from MOSE with --mose and --swbli-seed' % t)
+                continue
+            if not os.path.isdir(src):
+                print('%-45s no such test in %s' % (t, root))
+                continue
+            work = os.path.join(tmp, name_of(t))
+            from_mose(t, src, work)
+            dst = os.path.join(HERE, t)
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            os.makedirs(dst)
+            ini = open(os.path.join(work, 'input.ini')).read()
+            shutil.copyfile(os.path.join(work, 'input.ini'), os.path.join(dst, 'input.ini'))
+            left = []
+            for d in ('INPUT', 'MESH'):
+                names = sorted(os.listdir(os.path.join(work, d)))
+                for f in names:
+                    m = GRID_VARIANT.match(f)
+                    if d == 'INPUT' and m and '%s.%s' % m.groups() in names and f not in ini:
+                        left.append(f)      # the field or boundary file of a grid the case does not use
+                        continue
+                    os.makedirs(os.path.join(dst, d), exist_ok=True)
+                    shutil.copyfile(os.path.join(work, d, f), os.path.join(dst, d, f))
+            print('%-45s imported%s' % (t, ', left out ' + ' '.join(left) if left else ''))
+    finally:
+        shutil.rmtree(tmp)
 
 
 def submit(args):
@@ -250,9 +311,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = ap.add_subparsers(dest='cmd')
     p = sub.add_parser('stage')
-    p.add_argument('--mose', required=True, help='a checkout of MOSE (open-hydra/MOSE)')
     p.add_argument('--work', required=True, help='where to stage the cases')
     p.add_argument('--one-iteration', action='store_true', help='iter-threshold = 1: the regression table')
+    p.add_argument('--mose', help='a checkout of MOSE (open-hydra/MOSE), for the two swbli cases')
     p.add_argument('--swbli-seed', help='DIR/SA/field.tec and DIR/SST/field.tec, the coarse-level fields of MOSE')
     p.add_argument('tests', nargs='*')
     p = sub.add_parser('submit')
@@ -267,6 +328,9 @@ def main():
     p = sub.add_parser('compare')
     p.add_argument('reference')
     p.add_argument('new')
+    p = sub.add_parser('import')
+    p.add_argument('--mose', required=True, help='a checkout of MOSE (open-hydra/MOSE)')
+    p.add_argument('tests', nargs='*')
     args = ap.parse_args()
     if args.cmd == 'stage':
         stage(args)
@@ -276,6 +340,8 @@ def main():
         md5(args)
     elif args.cmd == 'compare':
         sys.exit(compare(args))
+    elif args.cmd == 'import':
+        import_cases(args)
     else:
         ap.print_help()
 

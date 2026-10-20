@@ -5,6 +5,7 @@
   mose build  [CASE]                  make sure the matching binary exists (submits its build job if not)
   mose submit [CASE] [-n N] [-p PART] [-t TIME] [-J NAME] [--mem MEM] [--nodelist NODE] [--dry-run]
   mose list                           the binaries already built
+  mose case   [NAME [DEST]]           the test cases of MOSE kept in test/; copy one, ready to run
   mose example                        print an annotated GPU input.ini
 
 CASE is the case folder (default: the current one): input.ini + INPUT/.
@@ -795,6 +796,31 @@ def cmd_list(args):
     return 0
 
 
+def cmd_case(args):
+    root = os.path.join(HERE, 'test')
+    cases = sorted(os.path.relpath(d, root) for d, _, files in os.walk(root) if 'input.ini' in files)
+    if not args.name:
+        for c in cases:
+            print('%-40s %s' % (c, c.replace('/', '_')))
+        print('-> mose case NAME [DEST]: NAME is the path, the table name or the last part of the path (Sod79)')
+        return 0
+    name = args.name.strip('/')
+    hits = [c for c in cases if name in (c, c.replace('/', '_'))] or [c for c in cases if os.path.basename(c) == name]
+    if not hits:
+        raise Fail('no test case %s in %s: mose case lists them' % (name, root))
+    if len(hits) > 1:
+        raise Fail('%s is ambiguous: %s' % (name, ', '.join(hits)))
+    dest = os.path.abspath(args.dest or os.path.join('/scratch', os.environ.get('USER', 'user'), hits[0].replace('/', '_')))
+    if os.path.lexists(dest):
+        raise Fail('%s already exists: nothing copied (give another DEST)' % dest)
+    shutil.copytree(os.path.join(root, hits[0]), dest,
+                    ignore=shutil.ignore_patterns('OUTPUT', 'mose_*.out', 'mose_run.sbatch'))
+    for d in ('INPUT', 'MESH', 'OUTPUT'):
+        os.makedirs(os.path.join(dest, d), exist_ok=True)
+    print('-> %s copied to %s\n   cd %s && %s submit . -p <gpu partition>' % (hits[0], dest, dest, os.path.join(HERE, 'mose')))
+    return 0
+
+
 def cmd_example(args):
     path = os.path.join(HERE, 'docs', 'user', 'input.gpu.example.ini')
     if not os.path.isfile(path):
@@ -825,6 +851,9 @@ def main():
             p.add_argument('--cpus-per-task', type=int, default=8)
             p.add_argument('--nodelist')
     sub.add_parser('list')
+    p = sub.add_parser('case')
+    p.add_argument('name', nargs='?')
+    p.add_argument('dest', nargs='?', help='default: /scratch/$USER/<table name>')
     sub.add_parser('example')
     args = ap.parse_args()
     args.src = os.path.realpath(args.src)
@@ -833,7 +862,7 @@ def main():
             ap.print_help()
             return 1
         return {'check': cmd_check, 'build': cmd_build, 'submit': cmd_submit,
-                'list': cmd_list, 'example': cmd_example}[args.cmd](args)
+                'list': cmd_list, 'case': cmd_case, 'example': cmd_example}[args.cmd](args)
     except Fail as e:
         print('mose: %s' % e, file=sys.stderr)
         return 2

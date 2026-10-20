@@ -44,11 +44,13 @@ MPI rank. On the test cases of MOSE it gives the same results as MOSE.
 ```bash
 git clone --recurse-submodules https://github.com/open-hydra/MOSE-GPU.git
 
-# from a case folder (input.ini + INPUT/): build the binary the case needs, then run it
-cd my_case
-/path/to/MOSE-GPU/mose check .
+# a test case of MOSE, copied to /scratch/$USER/1D_Sod79: build the binary it needs, then run it
+MOSE-GPU/mose case Sod79
+cd /scratch/$USER/1D_Sod79
 /path/to/MOSE-GPU/mose submit . -p <gpu partition>
 ```
+
+A case of your own runs the same way from its folder (`input.ini` + `INPUT/`); `mose check .` says first what it needs.
 
 To build by hand: `./install.sh build --production`; the executable is placed in `bin/MOSE`.
 
@@ -76,7 +78,7 @@ MOSE-GPU/
 │   │   └── gpu/       # The flat device state and the shared kernel bodies
 │   └── test/          # Unit tests
 ├── lib/               # FLINT, ORION, FiNeR
-├── test/              # Regression table on the test cases of MOSE
+├── test/              # The test cases of MOSE, ready to run, and the regression table
 ├── scripts/           # Boundary-file checks
 ├── docs/              # MkDocs documentation source
 ├── cmake/             # CMake modules

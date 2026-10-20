@@ -8,6 +8,7 @@ mose check  [CASE]                  what the case needs and whether the GPU buil
 mose build  [CASE]                  make sure the matching binary exists (submits its build job if not)
 mose submit [CASE] [-n N] [-p PART] [-t TIME] [-J NAME] [--mem MEM] [--nodelist NODE] [--dry-run]
 mose list                           the binaries already built
+mose case   [NAME [DEST]]           the test cases of MOSE kept in test/; copy one, ready to run
 mose example                        print an annotated input.ini of the native GPU dialect
 ```
 
@@ -44,6 +45,12 @@ queue.
 | `-J NAME` | job name |
 | `--mem MEM` | memory per node |
 | `--dry-run` | show what would be done, submit nothing |
+
+## case
+
+`mose case` lists the test cases kept in `test/`, by their path and their table name. `mose case NAME [DEST]` copies one
+to DEST, by default `/scratch/$USER/<table name>`. NAME is the path (`1D/Sod79`), the table name (`1D_Sod79`) or, when no
+other case shares it, the last part of the path (`Sod79`). When DEST already exists nothing is copied.
 
 ## The binary cache
 
