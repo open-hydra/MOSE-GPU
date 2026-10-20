@@ -26,8 +26,10 @@ the boundary conditions (`bc.txt`) and the thermodynamics of air.
 ## 3. Run it
 
 ```bash
-/path/to/MOSE-GPU/mose submit . -n 1 -p <gpu partition>
+/path/to/MOSE-GPU/mose solve .
 ```
+
+`-p` chooses the SLURM partition, the GPU nodes the run goes to (by default `fatgpu`); `-n` the number of GPUs.
 
 The first run of a case type also builds its binary; the run job starts when the build ends. The job log `mose_<id>.out`
 starts with the binary, its md5 and the source commits, and ends with the exit code and the wall time.

@@ -47,7 +47,7 @@ git clone --recurse-submodules https://github.com/open-hydra/MOSE-GPU.git
 # a test case of MOSE, copied to /scratch: build the binary it needs, then run it
 cp -r MOSE-GPU/test/1D/Sod79 /scratch/$USER/sod
 cd /scratch/$USER/sod
-/path/to/MOSE-GPU/mose submit . -p <gpu partition>
+/path/to/MOSE-GPU/mose solve .
 ```
 
 A case of your own runs the same way from its folder (`input.ini` + `INPUT/`); `mose check .` says first what it needs.
@@ -79,7 +79,7 @@ MOSE-GPU/
 │   └── test/          # Unit tests
 ├── lib/               # FLINT, ORION, FiNeR
 ├── test/              # The test cases of MOSE, ready to run, and the regression table
-├── scripts/           # Boundary-file checks
+├── scripts/           # Boundary-file checks, Tab completion of mose
 ├── docs/              # MkDocs documentation source
 ├── cmake/             # CMake modules
 ├── mose               # The launcher

@@ -21,7 +21,7 @@ choose a kernel variant. What remains is the mechanism of the binary, the chemis
 
 ## Automatic builds
 
-You normally do not call `install.sh`: `mose submit` reads the case and builds the matching binary with the recipe above,
+You normally do not call `install.sh`: `mose solve` reads the case and builds the matching binary with the recipe above,
 once. The case sets the compile-time constants:
 
 | Constant | Read from |

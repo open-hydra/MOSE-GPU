@@ -32,11 +32,18 @@ their own repositories. `FiNeR` is a Git submodule, as in MOSE.
 
 ## Building with the launcher
 
-From a case folder, `mose submit` builds the binary the case needs and runs it:
+From a case folder, `mose solve` builds the binary the case needs and runs it:
 
 ```bash
 cd my_case                       # input.ini + INPUT/ + MESH/
-/path/to/MOSE-GPU/mose submit .
+/path/to/MOSE-GPU/mose solve .
+```
+
+To type only `mose`, and to complete it with Tab, add to `~/.bashrc`:
+
+```bash
+export PATH=/path/to/MOSE-GPU:$PATH
+source /path/to/MOSE-GPU/scripts/mose_completion.sh
 ```
 
 The launcher reads three compile-time constants from the case:
@@ -77,7 +84,7 @@ variables and options:
 |---|---|---|
 | binary cache | `/scratch/$USER/mose_builds` | `MOSE_BUILDS` |
 | build partition | `free` | `MOSE_BUILD_PARTITION` |
-| run partition | `fatgpu` | `mose submit -p <partition>` |
+| run partition | `fatgpu` | `mose solve -p <partition>` |
 | HPC SDK location | `/opt/share/libs/nvidia/hpc_sdk/Linux_x86_64/24.11` | `NVHPC_ROOT` |
 | modules loaded by the jobs | `nvidia/nvhpc/24.11`, `nvidia/cuda-12.6.2` | the job templates in `mose` |
 

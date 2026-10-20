@@ -6,7 +6,7 @@ ghost cells between blocks on different ranks are exchanged every stage.
 ## The block-to-rank map
 
 `INPUT/block_owner.txt` gives the owner of every block: one integer per block, the rank, starting from 0. Without the file
-the blocks are distributed by size: largest first, each to the least loaded rank. `mose submit` takes the number of ranks
+the blocks are distributed by size: largest first, each to the least loaded rank. `mose solve` takes the number of ranks
 from the file when `-n` is not given, and refuses a `-n` that does not match it.
 
 Two constraints come from the device boundary conditions:

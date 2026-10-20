@@ -3,11 +3,13 @@
 
   mose check  [CASE]                  what the case needs and whether the GPU build runs it
   mose build  [CASE]                  make sure the matching binary exists (submits its build job if not)
-  mose submit [CASE] [-n N] [-p PART] [-t TIME] [-J NAME] [--mem MEM] [--nodelist NODE] [--dry-run]
+  mose solve  [CASE] [-n N] [-p PART] [-t TIME] [-J NAME] [--mem MEM] [--nodelist NODE] [--dry-run]
   mose list                           the binaries already built
   mose example                        print an annotated GPU input.ini
 
-CASE is the case folder (default: the current one): input.ini + INPUT/.
+CASE is the case folder (default: the current one): input.ini + INPUT/. -p is the SLURM partition the run goes to, the
+GPU nodes it runs on (default fatgpu). `mose submit` is the old name of `mose solve`. A wrong or incomplete command is
+answered with what was probably meant; scripts/mose_completion.sh adds Tab completion.
 
 The binary is chosen from the case, nothing is set by hand:
   species count         lines after the first of INPUT/phase.txt (the count FLINT reads)
@@ -26,6 +28,7 @@ Environment: MOSE_SRC (source tree to build, default: the tree this script is in
 MOSE_BUILD_PARTITION (default free). Python 3.6+, standard library only.
 """
 import argparse
+import difflib
 import fcntl
 import hashlib
 import os
@@ -176,11 +179,11 @@ def bc_inflow_records(path):
 
 def read_case(case, src):
     """Everything mose needs from the case, plus the errors (stop) and warnings (go on) found on the way."""
-    c = {'case': case, 'errors': [], 'warnings': [], 'notes': OrderedDict()}
+    c = {'case': case, 'errors': [], 'warnings': [], 'hints': [], 'notes': OrderedDict()}
     err, warn, note = c['errors'].append, c['warnings'].append, c['notes']
     ini = os.path.join(case, 'input.ini')
     if not os.path.isfile(ini):
-        raise Fail('%s: no input.ini' % case)
+        raise Fail(no_case(case))
     secs, dups = read_ini(ini)
     c['secs'] = secs
     for d in dups:
@@ -188,6 +191,7 @@ def read_case(case, src):
 
     if not os.path.realpath(case).startswith('/scratch/'):
         err('the case is not on /scratch: the GPU nodes run only there')
+        c['hints'].append('copy it there: cp -r %s /scratch/%s/%s' % (case, os.environ.get('USER', 'user'), os.path.basename(case)))
 
     # species: the count FLINT reads from INPUT/phase.txt (Load_ThermoTransport: every line after the first)
     phase = os.path.join(case, 'INPUT', 'phase.txt')
@@ -714,6 +718,50 @@ def report(c, st=None, key=None, args=None):
         print('warning     ' + w)
     for e in c['errors']:
         print('ERROR       ' + e)
+    for h in c['hints']:
+        print('hint        ' + h)
+
+
+def no_case(case, depth=2, most=8):
+    """The message for a folder without input.ini: the case folders found below it, or how to start one."""
+    found, level = [], [case]
+    for _ in range(depth):
+        below = []
+        for d in level:
+            try:
+                subs = sorted(e.path for e in os.scandir(d) if e.is_dir() and e.name not in ('INPUT', 'MESH', 'OUTPUT'))
+            except OSError:
+                continue
+            found += [os.path.relpath(x, case) for x in subs if os.path.isfile(os.path.join(x, 'input.ini'))]
+            below += subs
+        level = below
+    cmd = next((w for w in sys.argv[1:] if w in ALIASES), 'solve')
+    text = 'no input.ini in %s: run mose from a case folder (input.ini + INPUT/), or give the folder' % case
+    if found:
+        text += '\n  case folders below it:\n' + '\n'.join('    mose %s %s' % (cmd, f) for f in found[:most])
+        if len(found) > most:
+            text += '\n    ... and %d more' % (len(found) - most)
+    else:
+        text += ('\n  to start from a test case of MOSE:\n    cp -r %s /scratch/%s/sod && cd /scratch/%s/sod && mose %s .'
+                 % (os.path.join(HERE, 'test', '1D', 'Sod79'), os.environ.get('USER', 'user'), os.environ.get('USER', 'user'), cmd))
+    return text
+
+
+def partitions():
+    """The SLURM partitions and whether their nodes have GPUs, {name: True/False}; empty when sinfo cannot be asked."""
+    exe = shutil.which('sinfo') or os.path.join(SLURM_FALLBACK, 'sinfo')
+    try:
+        p = subprocess.run([exe, '-h', '-o', '%P %G'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    parts = OrderedDict()
+    for line in (p.stdout.splitlines() if p.returncode == 0 else []):
+        w = line.split()
+        if w:
+            name = w[0].rstrip('*')
+            parts[name] = parts.get(name, False) or 'gpu' in ' '.join(w[1:])
+    return parts
 
 
 def prepare(args):
@@ -729,7 +777,7 @@ def prepare(args):
 
 def cmd_check(args):
     c, _, _ = prepare(args)
-    print('-> %s' % ('ready for the GPU' if not c['errors'] else '%d error(s): fix them before submitting' % len(c['errors'])))
+    print('-> %s' % ('ready for the GPU: mose solve' if not c['errors'] else '%d error(s): fix them before mose solve' % len(c['errors'])))
     return 1 if c['errors'] else 0
 
 
@@ -748,11 +796,21 @@ def cmd_build(args):
     return 0
 
 
-def cmd_submit(args):
+def cmd_solve(args):
     c, st, _ = prepare(args)
     n = args.ntasks or c['ranks'] or 1
     if c['ranks'] is not None and n != c['ranks']:
-        c['errors'].append('-n %d but INPUT/block_owner.txt uses ranks 0..%d: submit with -n %d' % (n, c['ranks'] - 1, c['ranks']))
+        c['errors'].append('-n %d but INPUT/block_owner.txt uses ranks 0..%d: run with -n %d' % (n, c['ranks'] - 1, c['ranks']))
+        print('ERROR       ' + c['errors'][-1])
+    parts = partitions()
+    if parts and not parts.get(args.partition):
+        if args.partition in parts:
+            why = 'its nodes have no GPU'
+        else:
+            close = difflib.get_close_matches(args.partition, list(parts), n=2, cutoff=0.5)
+            why = 'no such partition' + (' (did you mean %s?)' % ' or '.join(close) if close else '')
+        gpus = ', '.join(x for x in parts if parts[x]) or 'none'
+        c['errors'].append('-p %s: %s; the partitions with GPUs are %s' % (args.partition, why, gpus))
         print('ERROR       ' + c['errors'][-1])
     if c['errors']:
         print('-> not submitted: fix the errors above')
@@ -804,21 +862,62 @@ def cmd_example(args):
     return 0
 
 
+COMMANDS = ('check', 'build', 'solve', 'list', 'example')
+ALIASES = COMMANDS + ('submit',)
+EXAMPLES = """examples:
+  mose check .                     what the case in this folder needs, before the queue
+  mose solve .                     build the binary the case needs if it is missing, then run it
+  mose solve . -p gpu -n 2         the same on two GPUs of the partition gpu
+  mose solve /scratch/$USER/sod    a case given by its folder
+The case folder holds input.ini and INPUT/ and is on /scratch. mose -h lists every option."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that answers a wrong or incomplete command with what was probably meant and some examples."""
+    commands = {}       # the parser of each command, to answer with its own usage and options
+
+    def error(self, message):
+        top = Parser.commands['']
+        m = re.search(r"invalid choice: '([^']*)'", message)
+        if m:
+            here, message = top, 'unknown command %s' % m.group(1)
+            tips = difflib.get_close_matches(m.group(1), COMMANDS, n=2, cutoff=0.6)
+            known = {o for q in Parser.commands.values() for a in q._actions for o in a.option_strings}
+        else:
+            here = Parser.commands.get(next((w for w in sys.argv[1:] if w in ALIASES), None), self)
+            tips = []
+            known = {o for q in (here, top) for a in q._actions for o in a.option_strings}
+        for w in sys.argv[1:]:          # every option of the line that is not one of mose
+            w = w.split('=')[0]
+            if w.startswith('-') and w not in known and not re.match(r'-\d', w):
+                tips += [t for t in difflib.get_close_matches(w, sorted(known), n=2, cutoff=0.6) if t not in tips]
+        here.print_usage(sys.stderr)
+        print('%s: %s' % (here.prog, message), file=sys.stderr)
+        if tips:
+            print('did you mean: %s' % ', '.join(tips), file=sys.stderr)
+        if '-p/--partition' in message:
+            parts = partitions()
+            if parts:
+                print('the partitions with GPUs: %s' % ', '.join(x for x in parts if parts[x]), file=sys.stderr)
+        print('\n' + EXAMPLES, file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
-    ap = argparse.ArgumentParser(prog='mose', description=__doc__.split('\n')[0],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n', 2)[2])
+    ap = Parser(prog='mose', description=__doc__.split('\n')[0],
+                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n', 2)[2])
     ap.add_argument('--src', default=os.environ.get('MOSE_SRC', HERE), help='source tree to build (default: this tree)')
     ap.add_argument('--builds', default=os.environ.get('MOSE_BUILDS', os.path.join('/scratch', os.environ.get('USER', 'user'), 'mose_builds')))
     ap.add_argument('--build-partition', default=os.environ.get('MOSE_BUILD_PARTITION', 'free'))
-    sub = ap.add_subparsers(dest='cmd')
-    for name in ('check', 'build', 'submit'):
-        p = sub.add_parser(name)
+    sub = ap.add_subparsers(dest='cmd', metavar='{%s}' % ','.join(COMMANDS))
+    for name in ('check', 'build', 'solve'):
+        p = sub.add_parser(name, aliases=['submit'] if name == 'solve' else [])
         p.add_argument('case', nargs='?', default='.')
         p.add_argument('--dry-run', action='store_true', help='show what would be done, submit nothing')
-        if name == 'submit':
+        if name == 'solve':
             p.add_argument('-n', '--ntasks', type=int, help='MPI ranks (default: the ranks of INPUT/block_owner.txt, else 1)')
             p.add_argument('--gpus', type=int, help='GPUs (default: one per rank)')
-            p.add_argument('-p', '--partition', default='fatgpu')
+            p.add_argument('-p', '--partition', default='fatgpu', help='SLURM partition of the run (default: fatgpu)')
             p.add_argument('-t', '--time', default='02:00:00')
             p.add_argument('-J', '--name')
             p.add_argument('--mem', default='100G')
@@ -826,13 +925,15 @@ def main():
             p.add_argument('--nodelist')
     sub.add_parser('list')
     sub.add_parser('example')
+    Parser.commands = dict(sub.choices, **{'': ap})
     args = ap.parse_args()
     args.src = os.path.realpath(args.src)
     try:
         if args.cmd is None:
-            ap.print_help()
+            ap.print_usage()
+            print('\n' + EXAMPLES)
             return 1
-        return {'check': cmd_check, 'build': cmd_build, 'submit': cmd_submit,
+        return {'check': cmd_check, 'build': cmd_build, 'solve': cmd_solve, 'submit': cmd_solve,
                 'list': cmd_list, 'example': cmd_example}[args.cmd](args)
     except Fail as e:
         print('mose: %s' % e, file=sys.stderr)

@@ -91,5 +91,5 @@ once per direction and, for the diffusive flux, once more for the multicomponent
 | `mose_bind.sh` | per-rank placement of the CPU cores next to each GPU |
 | `install.sh`, `CMakeLists.txt`, `cmake/` | the build |
 | `test/` | the regression table on the test cases of MOSE: see [Testing](testing.md) |
-| `scripts/` | boundary-file checks |
+| `scripts/` | boundary-file checks, Tab completion of `mose` (`mose_completion.sh`) |
 | `docs/` | this documentation |

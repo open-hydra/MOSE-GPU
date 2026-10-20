@@ -258,7 +258,7 @@ def submit(args):
         d = os.path.join(work, n)
         if not os.path.isfile(os.path.join(d, 'input.ini')):
             continue
-        cmd = [sys.executable, MOSE_LAUNCHER, 'submit', '-n', '1', '-t', args.time, '-J', 't1_' + n, '.']
+        cmd = [sys.executable, MOSE_LAUNCHER, 'solve', '-n', '1', '-t', args.time, '-J', 't1_' + n, '.']
         if args.partition:
             cmd[3:3] = ['-p', args.partition]
         if args.mem:
@@ -320,7 +320,7 @@ def main():
     p.add_argument('--work', required=True)
     p.add_argument('-p', '--partition', default='')
     p.add_argument('-t', '--time', default='00:20:00')
-    p.add_argument('--mem', default='', help='memory per job, passed to mose submit')
+    p.add_argument('--mem', default='', help='memory per job, passed to mose solve')
     p.add_argument('tests', nargs='*')
     p = sub.add_parser('md5')
     p.add_argument('--work', required=True)

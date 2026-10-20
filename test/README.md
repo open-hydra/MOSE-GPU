@@ -13,7 +13,7 @@ To run one case, copy its folder to `/scratch` and submit it:
 
 ```bash
 cp -r /path/to/MOSE-GPU/test/1D/Sod79 /scratch/$USER/sod
-cd /scratch/$USER/sod && /path/to/MOSE-GPU/mose submit . -p <gpu partition>
+cd /scratch/$USER/sod && /path/to/MOSE-GPU/mose solve .
 ```
 
 The regression table:
