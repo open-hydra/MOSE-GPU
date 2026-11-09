@@ -11,6 +11,7 @@ module MOSE_IO_Solution
     logical             :: sol_dtime_grid = .false.        !> sol-dtime-grid: time-based dumps on the fixed grid t0 + k*sol-dtime (no drift)
     logical             :: sol_overwrite, bck_overwrite    !> switch to overwrite the solution
     character(clen)     :: sol_format(2), bck_format(2), ini_format(2)   !> solution format (native,tecplot,vtk) and formatting (ascii,raw)
+    character(clen)     :: rst_format(2)                   !> rst-format: the format a restart reads OUTPUT/field in (default bck-format)
     logical             :: write_thermo, write_transport, write_composition
     character(len=llen) :: sol_variables
     character(len=hlen) :: Ovarnames
@@ -102,6 +103,12 @@ contains
     call fini%get(section_name=trim(codename)//'-IO', option_name='sol-format', val=wholestring, error=errsol)
     if (errsol==0) call parse(wholestring,' ', self%sol_format)
     if (errbck/=0 .and. errsol==0) self%bck_format = self%sol_format
+    ! rst-format (mr-restart): the restart reads OUTPUT/field in this format, the backups are written in bck-format. An exact
+    ! restart needs a lossless file: bck-format = native binary (double precision; tecplot ascii has 15 digits, the
+    ! tecplot binary writer single precision)
+    self%rst_format = self%bck_format
+    call fini%get(section_name=trim(codename)//'-IO', option_name='rst-format', val=wholestring, error=error)
+    if (error==0) call parse(wholestring,' ', self%rst_format)
     call fini%get(section_name=trim(codename)//'-IO', option_name='bck-diter', val=self%bck_diter, error=error)
     call fini%get(section_name=trim(codename)//'-IO', option_name='bck-dtime', val=self%bck_dtime, error=error)
     call fini%get(section_name=trim(codename)//'-IO', option_name='sol-diter', val=self%sol_diter, error=error)
@@ -163,7 +170,7 @@ contains
       inquire(file=obj_io%nameinit, exist=present)
 
     else
-      select case (obj_io%bck_format(1))
+      select case (obj_io%rst_format(1))   ! rst-format (default bck-format)
       case('native')
         extension = '.bin'
         read_ic => read_native
@@ -171,7 +178,7 @@ contains
         extension = '.vtm'
         read_ic => read_vtk_tec
       case('tecplot')
-       if (obj_io%bck_format(2)=='ascii') then  ! restart branch: was wrongly reading ini_format(2)
+       if (obj_io%rst_format(2)=='ascii') then  ! restart branch: was wrongly reading ini_format(2)
           extension = '.tec'
         else
           extension = '.szplt'
@@ -228,6 +235,9 @@ contains
 
     !% Read the mesh file and store the geometric data into an orion-field
     IOfield%tec%format = 'ascii'
+    ! mr-restart: the grid can come from a tecplot binary file, e.g. the start field the run was made from (mesh-file =
+    ! OUTPUT/field.szplt): the same coordinates as the uninterrupted run that read it
+    if ( index(obj_io%meshfile, '.szplt', back=.true.) > 0 ) IOfield%tec%format = 'binary'
     ios = tec_read_structured_multiblock(orion=IOfield,filename=obj_io%meshfile)
     nb = size ( IOfield%block )
 
@@ -235,6 +245,7 @@ contains
     
     nvar = nsc+4+nrans
     do b = 1, nb
+      if ( allocated(IOfield%block(b)%vars) ) deallocate ( IOfield%block(b)%vars )   ! the variables of a field file
       allocate(IOfield%block(b)%vars(1:nvar,1:IOfield%block(b)%Ni, &
                                             1:IOfield%block(b)%Nj, &
                                             1:IOfield%block(b)%Nk) )
@@ -274,6 +285,9 @@ contains
     ! Time
     read(unitfile) obj_io%IOtime
     close(unitfile)
+    ! the restart takes the time from IOfield%solutiontime (Wrap_Setup): the time of the field file, not the one of the mesh
+    ! file (with mesh-file = OUTPUT/field.szplt that is the start time); a steady run writes -1 and keeps the old value
+    if ( obj_io%IOtime >= 0.d0 ) IOfield%solutiontime = obj_io%IOtime
 
   end subroutine read_native
 
@@ -296,8 +310,8 @@ contains
       format_1 = obj_io%ini_format(1)
       format_2 = obj_io%ini_format(2)
     else
-      format_1 = obj_io%bck_format(1)
-      format_2 = obj_io%bck_format(2)
+      format_1 = obj_io%rst_format(1)   ! rst-format (default bck-format)
+      format_2 = obj_io%rst_format(2)
     endif
 
     obj_io%IOtime = 0.d0

@@ -29,6 +29,10 @@ contains
     
       call Read_BCfile ( domain(m) % bc, domain(m) % nbound, domain(m) % n_bf, m )
 
+      ! Block-to-rank map, second pass: now that the connection records are known the blocks
+      ! go to the ranks by contiguity (before anything reads is_local_block on bc records).
+      if (m == 1) call Partition_By_Connectivity ( domain(m) )
+
       if (m == 1) call Setup_Q2D_BC_Data ( domain(m) )
 
       if ((any(viscous_flag)) .and. (.not.VISC)) then
@@ -39,6 +43,48 @@ contains
     end do
 
   end subroutine Setup_BC
+
+
+  !> Second pass of the block-to-rank partition, once the connection records are known
+  !> (Mod_MPI partition_blocks_connectivity): the directed table of connection cells between
+  !> blocks (wd(b,bs) = ghost cells of block b fed by block bs), then the final map, printed
+  !> per block by the root. The table is dense (nb x nb): above 4096 blocks the pass is skipped.
+  subroutine Partition_By_Connectivity ( domain )
+    use MOSE_Mod_MPI, only: partition_blocks_connectivity, block_owner, mpi_is_root, mpi_size_
+
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    ! Local
+    integer :: i, b, nb
+    integer, allocatable :: wd(:,:), blk_ncells(:)
+
+    nb = domain % nb
+    if ( mpi_size_ > 1 ) then
+      if ( nb > 4096 ) then
+        if ( mpi_is_root ) write(*,'(A)') ' Block partition by connectivity skipped: more than 4096 blocks (LPT by size kept)'
+      else
+        allocate ( wd(nb, nb), blk_ncells(nb) )
+        wd = 0
+        do i = 1, domain % nbound
+          if ( domain % bc(i) % type /= 1 ) cycle
+          wd(domain % bc(i) % b, domain % bc(i) % bs) = wd(domain % bc(i) % b, domain % bc(i) % bs) + 1
+        end do
+        do b = 1, nb
+          blk_ncells(b) = domain % blk(b) % dim(1) * domain % blk(b) % dim(2) * domain % blk(b) % dim(3)
+        end do
+        call partition_blocks_connectivity ( nb, blk_ncells, wd )
+        deallocate ( wd, blk_ncells )
+      end if
+    end if
+
+    if ( mpi_is_root ) then
+      write(*,'(A)') ' Block map (rank per block):'
+      do b = 1, nb
+        write(*,'(A9,I3,A3,3I5,A8,I3)') ' - Block ', b, ' = ', domain % blk(b) % dim, '  rank =', block_owner(b)
+      end do
+    end if
+
+  end subroutine Partition_By_Connectivity
 
 
   subroutine Allocate_BC ( domain )

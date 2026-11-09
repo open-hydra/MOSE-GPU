@@ -23,6 +23,7 @@ onto a closure of the GPU code.
 | 406 | back-pressure outlet | |
 | 407 | inflow or outflow by the sign of the normal velocity | |
 | 420 | nozzle inlet | |
+| 410 | mapped state from a time-varying file | ghost from the file at the stage time, turbulence columns included, connection flux, as MOSE_open |
 | 501 | manifold connection | one rank only |
 
 ## Types that stop the run
@@ -32,7 +33,7 @@ onto a closure of the GPU code.
 | 103 | coupled multi-solver wall |
 | 303, 304, 305–309 | walls with radiation, pyrolysis and the other wall models |
 | 408 | prescribed-velocity inlet |
-| 409, 410 | other inlets and mapped states |
+| 409 | other inlets |
 | 502 | solid-rocket-motor grain |
 | 503–506 | ablating and gas–surface-interaction walls |
 | any inlet | inside a rotating frame |

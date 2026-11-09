@@ -1,6 +1,13 @@
 module MOSE_Mod_BC
+  use MOSE_Lib_Multirate_Base, only: mr_bl_type
 
   implicit none
+
+  ! The record lists of the boundary fluxes of the explicit step (bc_list_setup): one per block face, every record of
+  ! every local block, gathered as the lists of a multirate level; bc_list_mode -1 = not decided yet, 0 = the per-block
+  ! launches (BC_Fluxes_blk), 1 = the lists (BC_Fluxes_list). bla_nb / bla_nbound: the domain the lists were built for.
+  type(mr_bl_type), allocatable, save :: bla(:)
+  integer, save :: bc_list_mode = -1, bla_nb = -1, bla_nbound = -1
 
 ! PWARG threads either (w, ncw, boff, pi, pj) or (P) through the
 ! BC dispatch kernel's SIGNATURE and its per-entry BC_*_dev CALL sites identically
@@ -66,6 +73,11 @@ contains
               end if
             end do
           end block
+        case (667)
+          ! MOSE_open 410 (mapped Q2D state): device ghost from the file at the stage time (Ghost_Q2D_Layers/_Edges,
+          ! Mod_BC_Q2D) + the connection twins; local to the rank of its block
+          if (ROTATING_FRAME) &
+            error stop 'F4c device BC: 667 (MOSE_open 410) in a rotating frame not ported'
         case (1001)
           ! manifold mean connection: device source-face reduction + inflow twin.
           ! Single-rank only (the reduction reads the local w arena).
@@ -87,8 +99,9 @@ contains
   subroutine Setup_BC_Device ( domain )
     use MOSE_Types_m
     use MOSE_Global_m, only: nsc, nrans, nprim, ROTATING_FRAME
-    use MOSE_Mod_MPI, only: is_local_block, mpi_size_
+    use MOSE_Mod_MPI, only: is_local_block, mpi_size_, mpi_is_root
     use MOSE_Mod_GhostExchange, only: finalize_pg_tables
+    use MOSE_Lib_BC, only: conn_fast_dev
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
@@ -99,6 +112,22 @@ contains
     nbnd = domain % nbound
     if (nbnd <= 0) return
     if (allocated(domain % bc_bi)) return        ! already built for this level
+
+    ! mr-conn-fast (Lib_BC conn_fast_dev): MOSE_CONN_FAST = 0 (as before) / 1 (face state once) / 2 (lean, default)
+    block
+      character(8) :: env
+      integer :: ln, st
+      call get_environment_variable ( 'MOSE_CONN_FAST', env, ln, st )
+      conn_fast_dev = 2
+      if ( st == 0 .and. ln > 0 ) then
+        if ( env(1:1) == '0' .or. env(1:1) == 'n' .or. env(1:1) == 'N' .or. env(1:1) == 'f' .or. env(1:1) == 'F' ) &
+          conn_fast_dev = 0
+        if ( env(1:1) == '1' ) conn_fast_dev = 1
+      end if
+      !$acc update device(conn_fast_dev)
+      if ( mpi_is_root ) write(*,'(A,I0)') ' [BC] mr-conn-fast (connection records: 0 as before, 1 face state once, 2 lean): ', &
+                                           conn_fast_dev
+    end block
 
     allocate ( domain % bc_bi(nbnd), domain % bc_bj(nbnd), domain % bc_bk(nbnd), &
                domain % bc_bf(nbnd), domain % bc_typ(nbnd) )
@@ -623,13 +652,23 @@ contains
     use MOSE_Field_m, only: P_flat, R_flat, ncell_total, field_is_allocated, field_alloc, &
                             pack_P_to_flat, field_update_P_flat_device, field_block_index_params
     use MOSE_Lib_Preconditioning, only: ur_f, Prec_Alloc
+    use MOSE_Lib_Multirate_Base, only: mr_block_active, mr_stage_on, mrb, obj_mr, mr_rec_on, mrbl, mr_q_async
+    use MOSE_Global_m, only: gc, nprim
+    use MOSE_Mod_BC_Q2D, only: q2d_time, q2d_time_set
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
     integer  :: b, i, js, qarg, nur
-    real(R8) :: delthe_l
+    real(R8) :: delthe_l, t_bc
     logical, save :: bc_tv_checked = .false., bc_has_tv_inlet = .false.
     integer  :: ncw, nrw, boff, pi, pj, wroff
+    ! the record list of a multirate stage; outside one a resident placeholder (the kernels loop over the ranges)
+    integer, allocatable, save :: lst0(:)
+    integer, parameter :: nz6(6) = 0
+    ! the list path: a resident stand-in for the per-block var-first r the record twins take (they never touch it), as
+    ! large as the largest block so the explicit-shape dummies conform
+    real(R8), allocatable, save :: r0(:,:)
+    integer :: f, l, nmax
     ! Stream count for the per-block async fan-out (unconditional since 2026-07-11).
     ! Default 2 = the measured A30 plateau; runtime env MOSE_BC_NQ overrides.
     integer, save :: bc_nq = -1
@@ -660,10 +699,14 @@ contains
       bc_tv_checked = .true.
     end if
     if (bc_has_tv_inlet) then
+      t_bc = domain % time
+      if ( q2d_time_set ) t_bc = q2d_time
       do i = 1, domain % nbound
         js = domain % bc_perm(i)
+        ! p0(t) at the time of the stage (as the boundary data of type 667, Lib_Extrapolation Fill_Ghost_Cell): t^n + theta dt
+        ! of the RK stage, or the stage time of the multirate ladder; domain%time is t^n + dt for every stage
         if (domain % bc(js) % type == 4 .and. domain % bc(js) % p0time % exists) &
-          domain % bc_p0(i) = domain % bc(js) % p0time % update(domain % time)
+          domain % bc_p0(i) = domain % bc(js) % p0time % update(t_bc)
       end do
       !$acc update device(domain % bc_p0)
     end if
@@ -674,6 +717,10 @@ contains
     ! between there and here (flux only writes r), so NO pack here. boff/pi/pj are host
     ! scalars fetched per block; ncw = ncell_total.
     if (.not. field_is_allocated()) call field_alloc(domain)
+    if (.not. allocated(lst0)) then
+      allocate ( lst0(1) ); lst0 = 0
+      !$acc enter data copyin(lst0)
+    end if
     ncw = ncell_total; nrw = ncw
     call Prec_Alloc ()   ! ur_f (HLLC-PC at the boundary faces): ncell_total with prec, 1 element otherwise
     nur = size(ur_f)
@@ -685,12 +732,34 @@ contains
 
     ! Ghost-fill / bc_pg device writes (default queue) must complete before the async BC
     ! kernels READ bc_pg + the resident ghosts. One blanket wait covers every prior queue.
-    !$acc wait
+    ! mr-async: on a list stage the fills and the BC list kernels share the stage queue (in order): no wait, unless a
+    ! manifold update ran on the default queue just above.
+    if ( domain % n_mfold > 0 .or. .not. mr_q_async() ) then
+      !$acc wait
+    end if
+    ! a list level of a multirate stage (mr-list-level): the level's records of every local block, one launch per block
+    ! face in face order (the per-cell order of the per-block launches), the values of the record body gathered by list
+    if ( mr_rec_on() ) then
+      l = obj_mr%lcur
+      call bc_lists ( mrbl(:,l) )
+      return
+    end if
+    ! the explicit step (no multirate stage): every record of every local block on the lists of bc_list_setup (the same
+    ! launches as a list level; MOSE_BC_LIST=0, a shock detector or a 3D periodic seam keep the per-block launches below)
+    if ( .not. mr_stage_on() ) then
+      if ( bc_list_mode < 0 ) call bc_list_setup ( domain )
+      if ( bc_list_mode == 1 .and. domain % nb == bla_nb .and. domain % nbound == bla_nbound ) then
+        call bc_lists ( bla )
+        return
+      end if
+    end if
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle
       if (domain % bc_blk_hi(b) < domain % bc_blk_lo(b)) cycle
+      if (.not. mr_block_active(b)) cycle   ! multirate stage: no cell of the stage's level in this block
       call field_block_index_params(b, boff, pi, pj); wroff = boff
       qarg = mod(b-1, bc_nq) + 1     ! blocks sharing a stream serialize (still race-free; just less concurrency)
+      if ( mr_stage_on() ) then      ! multirate stage: the records of the stage's level only (Mod_Multirate_Partition)
       call BC_Fluxes_blk ( PWPASS,   domain % blk(b) % r,   &
                                domain % blk(b) % fm1, domain % blk(b) % fm2, &
                                domain % blk(b) % fm3, domain % blk(b) % dl_f, &
@@ -702,12 +771,106 @@ contains
                                domain % bc_mach, domain % bc_t0, domain % bc_p0, &
                                domain % bc_relfac, domain % bc_alpha, domain % bc_beta, &
                                domain % bc_pamb, domain % bc_ci, domain % bc_rans, domain % bc_tvec, &
-                               domain % bc_tw, domain % bc_pg, delthe_l, qarg )
+                               domain % bc_tw, domain % bc_pg, delthe_l, qarg, &
+                               mrb(b)%bcl, size(mrb(b)%bcl), mrb(b)%bcn(:,obj_mr%lcur), mrb(b)%bco(:,obj_mr%lcur), .true. )
+      else
+      call BC_Fluxes_blk ( PWPASS,   domain % blk(b) % r,   &
+                               domain % blk(b) % fm1, domain % blk(b) % fm2, &
+                               domain % blk(b) % fm3, domain % blk(b) % dl_f, &
+                               domain % blk(b) % m_f, domain % blk(b) % yn,  &
+                               domain % blk(b) % beta, domain % blk(b) % dim, &
+                               domain % bc_bi, domain % bc_bj, domain % bc_bk, &
+                               domain % bc_bf, domain % bc_typ, domain % nbound, &
+                               domain % n_bf(b,1:6), domain % bc_blk_lo(b), &
+                               domain % bc_mach, domain % bc_t0, domain % bc_p0, &
+                               domain % bc_relfac, domain % bc_alpha, domain % bc_beta, &
+                               domain % bc_pamb, domain % bc_ci, domain % bc_rans, domain % bc_tvec, &
+                               domain % bc_tw, domain % bc_pg, delthe_l, qarg, &
+                               lst0, 1, nz6, nz6, .false. )
+      end if
     end do
     ! Drain every per-block BC queue before downstream stages (Newstate/chemistry) read r/R_flat.
     !$acc wait
 
+  contains
+
+    !> The launches on the record lists bl(1:6) (a multirate level, or every record for the explicit step): one per block
+    !> face in face order, then the drain. r0 stands in for the per-block var-first r the record twins take.
+    subroutine bc_lists ( bl )
+      type(mr_bl_type), intent(in) :: bl(:)
+      if ( .not. allocated(r0) ) then
+        nmax = 1
+        do b = 1, domain % nb
+          if (is_local_block(b)) nmax = max( nmax, product(domain%blk(b)%dim + 2*gc) )
+        end do
+        allocate ( r0(nprim, nmax) ); r0 = 0.0_R8
+        !$acc enter data copyin(r0)
+      end if
+      do f = 1, 6
+        if ( bl(f)%n == 0 ) cycle
+        call BC_Fluxes_list ( P_flat, R_flat, ncw, nrw, ur_f, nur, r0, size(r0,2), &
+                              bl(f)%rec, bl(f)%rb, bl(f)%gn, bl(f)%gdl, bl(f)%gm, bl(f)%gy, &
+                              bl(f)%n, domain % bc_bi, domain % bc_bj, domain % bc_bk, domain % bc_bf, domain % bc_typ, &
+                              domain % nbound, domain % bc_mach, domain % bc_t0, domain % bc_p0, &
+                              domain % bc_relfac, domain % bc_alpha, domain % bc_beta, &
+                              domain % bc_pamb, domain % bc_ci, domain % bc_rans, domain % bc_tvec, &
+                              domain % bc_tw, domain % bc_pg, delthe_l )
+      end do
+      if ( .not. mr_q_async() ) then   ! mr-async: the downstream kernels follow on the same queue
+        !$acc wait
+      end if
+    end subroutine bc_lists
+
   end subroutine BC_Fluxes
+
+
+  !> The record lists of the explicit step's boundary fluxes (bla), decided once: MOSE_BC_LIST=0 keeps the per-block
+  !> launches (BC_Fluxes_blk, 3 per block, every record of the block in each); otherwise every record of every local block
+  !> goes on the lists of mr_gather_bc_list -- one launch per block face over all the blocks (BC_Fluxes_list, measured
+  !> 3x faster per record on the multirate stages) -- when the gather allows it: no 3D rotational periodic seam, and no
+  !> shock detector (the gather takes beta of the connection records once, from the host: with the detector beta
+  !> changes every stage).
+  subroutine bc_list_setup ( domain )
+    use MOSE_Types_m, only: MOSE_domain_type
+    use MOSE_Mod_MPI, only: mpi_is_root
+    use MOSE_Lib_Limiters, only: SD_space_order
+    use MOSE_Lib_Shock_Detector, only: sd_dev
+    use MOSE_Lib_Multirate_Base, only: mr_setup_dn, mr_gather_bc_list
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    character(32) :: env
+    character(48) :: why
+    integer :: st, f
+    logical :: ok
+    bc_list_mode = 1; why = ''
+    call get_environment_variable ( "MOSE_BC_LIST", env, status = st )
+    if ( st == 0 ) then
+      if ( trim(adjustl(env)) == '0' ) then
+        bc_list_mode = 0; why = 'MOSE_BC_LIST=0'
+      end if
+    end if
+    if ( bc_list_mode == 1 .and. ( SD_space_order .or. sd_dev > 0 ) ) then
+      bc_list_mode = 0; why = 'shock detector on'
+    end if
+    if ( bc_list_mode == 1 ) then
+      call mr_setup_dn ( domain )
+      allocate ( bla(6) )
+      call mr_gather_bc_list ( domain, -1, bla, ok )
+      if ( ok ) then
+        bla_nb = domain % nb; bla_nbound = domain % nbound
+      else
+        bc_list_mode = 0; why = '3D rotational periodic records'; deallocate ( bla )
+      end if
+    end if
+    if ( mpi_is_root ) then
+      if ( bc_list_mode == 1 ) then
+        write(*,'(A,6(1X,I0))') ' [BC] explicit step: boundary fluxes on record lists, records per block face', &
+                                 (bla(f)%n, f = 1, 6)
+      else
+        write(*,'(A)') ' [BC] explicit step: boundary fluxes on per-block launches ('//trim(why)//')'
+      end if
+    end if
+  end subroutine bc_list_setup
 
 
   !----------------------------------------------------------------------------
@@ -722,12 +885,13 @@ contains
   subroutine BC_Fluxes_blk ( PWARG, r, fm1, fm2, fm3, dl_f, m_f, yn, beta, n, &
                                  bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, nbnd, nbf6, off, &
                                  bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, &
-                                 bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg, delthe, qb )
+                                 bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg, delthe, qb, lst, nlst, lcnt, loff, uselist )
     use iso_fortran_env, only: R8 => real64
     use MOSE_Global_m, only: gc, VISC, nprim, nsc, nrans, nu, nv, nw
     use MOSE_Lib_BC,   only: BC_Symmetry_Eul, BC_Symmetry_Visc, BC_Extrapolation, &
                              BC_Inflow_Outflow, BC_Outlet, BC_Inflow_Nozzle, BC_Connection_Eul, &
-                             BC_Connection_Visc, BC_Rotational_Periodic_Eul, BC_Wall_Heat_dev, &
+                             BC_Connection_Visc, BC_Connection_Visc_fast, BC_Connection_Eul_lean, BC_Connection_Visc_lean, &
+                             conn_fast_dev, BC_Rotational_Periodic_Eul, BC_Wall_Heat_dev, &
                              BC_Wall_Temperature_dev
 
     implicit none
@@ -753,8 +917,11 @@ contains
     real(R8), intent(in)    :: bc_tw(nbnd)
     real(R8), intent(in)    :: bc_pg(nprim, 6, nbnd)
     real(R8), intent(in)    :: delthe   ! wedge angle (firstprivate scalar, type-2)
+    integer,  intent(in)    :: nlst, lst(nlst)        ! multirate stage: the records of the stage's level (Lib_Multirate_Base bcl)
+    integer,  intent(in)    :: lcnt(6), loff(6)       ! ... per launch g: lst(loff(g)+1 : loff(g)+lcnt(g))
+    logical,  intent(in)    :: uselist                ! t: the launches sweep the list; f: every record of their range
     ! Local
-    integer  :: f, idx, lo, hi, base, ierr, flo
+    integer  :: g, ng, glo(6), ghi(6), idx, lo, hi, e, nl_, ol_, ierr
     integer  :: Im, Jm, Km, Fm, dir, modfm, gstep, Fi, Fj, Fk, Ii, Ij, Ik
     integer  :: Ig_, Jg_, Kg_, o1_, o2_, o3_, o4_     ! 5r-b: derived here, not inside the routines
     real(R8) :: normal(3), area, Bound_Dl, Int_Dl, dlc4_(4)
@@ -763,9 +930,7 @@ contains
     ! is implicitly copy()d per launch (upload+download+sync); scalars ride the
     ! launch parameters for free.
     integer :: nb1_, nb2_, nb3_
-    logical :: active_
     nb1_ = n(1); nb2_ = n(2); nb3_ = n(3)
-    base = off - 1
     ! BC FUSE opposite face pairs {1,2}{3,4}{5,6}: when the direction is non-degenerate
     ! (n_d>=2), the two faces write DISJOINT planes (face 2d-1 -> plane 1, face 2d -> plane
     ! n_d), so they run concurrently in ONE launch (6->3 launches, ~2x SM fill) with NO
@@ -773,6 +938,107 @@ contains
     ! corner on faces {1,3,5} accumulates in launch order 1->3->5, byte-identical to the
     ! 6-launch version (bit-exact + deterministic; golden 0.0). DEGENERATE direction (n_d=1)
     ! collapses opposite faces onto one plane -> would alias -> falls back to a per-face launch.
+    ! the launches: opposite faces fused (bc_launch_ranges); a multirate stage sweeps only its level's records of each range,
+    ! in the same launches and order (a range with none is not launched)
+    call bc_launch_ranges ( n, nbf6, off, ng, glo, ghi )
+    do g = 1, ng
+      lo = glo(g); hi = ghi(g)
+      if ( uselist ) then
+      nl_ = lcnt(g); ol_ = loff(g)
+      if ( nl_ == 0 ) cycle
+      !$acc parallel loop gang vector BCASYNC present(w, wr, ur, r, fm1, fm2, fm3, dl_f, m_f, yn, beta, lst, &
+      !$acc&   bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, &
+      !$acc&   bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg) &
+      !$acc&   private(idx, Im, Jm, Km, Fm, dir, modfm, gstep, Fi, Fj, Fk, Ii, Ij, Ik, ierr, &
+      !$acc&           normal, area, Bound_Dl, Int_Dl, Ig_, Jg_, Kg_, o1_, o2_, o3_, o4_, dlc4_, &
+      !$acc&           Mrec_, Mgho_, ynrec_, yngho_, beta_)
+      do e = 1, nl_
+        idx = lst(ol_ + e)
+#include "bc_record_body.inc"
+      end do
+      else
+      !$acc parallel loop gang vector BCASYNC present(w, wr, ur, r, fm1, fm2, fm3, dl_f, m_f, yn, beta, &
+      !$acc&   bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, &
+      !$acc&   bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg) &
+      !$acc&   private(Im, Jm, Km, Fm, dir, modfm, gstep, Fi, Fj, Fk, Ii, Ij, Ik, ierr, &
+      !$acc&           normal, area, Bound_Dl, Int_Dl, Ig_, Jg_, Kg_, o1_, o2_, o3_, o4_, dlc4_, &
+      !$acc&           Mrec_, Mgho_, ynrec_, yngho_, beta_)
+      do idx = lo, hi
+#include "bc_record_body.inc"
+      end do
+      end if
+    end do
+
+
+  end subroutine BC_Fluxes_blk
+
+
+  !> The boundary fluxes of a multirate list level over the records of one block face of every local block (Lib_Multirate_Base
+  !> mr_bl_type): per record the block's flat offset, row lengths and dims from the device tables, the values of
+  !> bc_record_body.inc from the gather, then bc_record_apply.inc -- the per-block kernel's work on the same record.
+  subroutine BC_Fluxes_list ( w, wr, ncw, nrw, ur, nur, r, nr, rec, rb, gn, gdl, gm, gy, ne, &
+                              bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, nbnd, &
+                              bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, &
+                              bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg, delthe )
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use iso_fortran_env, only: R8 => real64
+    use MOSE_Global_m, only: gc, VISC, nprim, nsc, nrans, nu, nv, nw
+    use MOSE_Lib_BC,   only: BC_Symmetry_Eul, BC_Symmetry_Visc, BC_Extrapolation, &
+                             BC_Inflow_Outflow, BC_Outlet, BC_Inflow_Nozzle, BC_Connection_Eul, &
+                             BC_Connection_Visc, BC_Connection_Visc_fast, BC_Connection_Eul_lean, BC_Connection_Visc_lean, &
+                             conn_fast_dev, BC_Rotational_Periodic_Eul, BC_Wall_Heat_dev, &
+                             BC_Wall_Temperature_dev
+    use MOSE_Field_m,  only: dboff, dpi, dpj
+    use MOSE_Lib_Multirate_Base, only: mr_dn
+    implicit none
+    integer,  intent(in)    :: ncw, nrw, nur, nr, ne, nbnd
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: wr(nrw, nprim)
+    real(R8), intent(in)    :: ur(nur)
+    real(R8), intent(inout) :: r(nprim, nr)
+    integer,  intent(in)    :: rec(ne), rb(ne)
+    real(R8), intent(in)    :: gn(4,ne), gdl(6,ne), gm(3,3,2,ne), gy(3,ne)
+    integer,  intent(in)    :: bc_bi(nbnd), bc_bj(nbnd), bc_bk(nbnd), bc_bf(nbnd), bc_typ(nbnd)
+    real(R8), intent(in)    :: bc_mach(nbnd), bc_t0(nbnd), bc_p0(nbnd), bc_relfac(nbnd)
+    real(R8), intent(in)    :: bc_alpha(nbnd), bc_beta(nbnd), bc_pamb(nbnd)
+    real(R8), intent(in)    :: bc_ci(nsc,nbnd), bc_rans(max(nrans,1),nbnd), bc_tvec(3,nbnd)
+    real(R8), intent(in)    :: bc_tw(nbnd)
+    real(R8), intent(in)    :: bc_pg(nprim, 6, nbnd)
+    real(R8), intent(in)    :: delthe
+    integer  :: e, idx, b, boff, pi, pj, wroff, nb1_, nb2_, nb3_, Im, Jm, Km, Fm, ierr
+    real(R8) :: normal(3), area, Bound_Dl, Int_Dl, dlc4_(4)
+    real(R8) :: Mrec_(3,3), Mgho_(3,3), ynrec_, yngho_, beta_
+    !$acc parallel loop gang vector async(mr_q) present(w, wr, ur, r, rec, rb, gn, gdl, gm, gy, dboff, dpi, dpj, mr_dn, &
+    !$acc&   bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, &
+    !$acc&   bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg) &
+    !$acc&   private(idx, b, boff, pi, pj, wroff, nb1_, nb2_, nb3_, Im, Jm, Km, Fm, ierr, &
+    !$acc&           normal, area, Bound_Dl, Int_Dl, dlc4_, Mrec_, Mgho_, ynrec_, yngho_, beta_)
+    do e = 1, ne
+      idx = rec(e); b = rb(e)
+      boff = dboff(b); pi = dpi(b); pj = dpj(b); wroff = boff
+      nb1_ = mr_dn(1,b); nb2_ = mr_dn(2,b); nb3_ = mr_dn(3,b)
+      Im = bc_bi(idx); Jm = bc_bj(idx); Km = bc_bk(idx); Fm = bc_bf(idx)
+      normal(1) = gn(1,e); normal(2) = gn(2,e); normal(3) = gn(3,e); area = gn(4,e)
+      Bound_Dl = gdl(1,e); Int_Dl = gdl(2,e)
+      dlc4_(1) = gdl(3,e); dlc4_(2) = gdl(4,e); dlc4_(3) = gdl(5,e); dlc4_(4) = gdl(6,e)
+      Mrec_ = gm(:,:,1,e); Mgho_ = gm(:,:,2,e)
+      ynrec_ = gy(1,e); yngho_ = gy(2,e); beta_ = gy(3,e)
+#define dl_f r
+#include "bc_record_apply.inc"
+#undef dl_f
+    end do
+  end subroutine BC_Fluxes_list
+
+
+  !> The launches of BC_Fluxes_blk for a block: the record ranges glo(g)..ghi(g), g = 1..ng, in launch order. The records
+  !> of the block are grouped by face (nbf6, from off); the two faces of a direction share one launch when the direction is
+  !> not degenerate (n_d >= 2: they write disjoint planes), else each face is a launch. Also the multirate record lists
+  !> (Mod_Multirate_Partition) follow these ranges.
+  subroutine bc_launch_ranges ( n, nbf6, off, ng, glo, ghi )
+    integer, intent(in)  :: n(3), nbf6(6), off
+    integer, intent(out) :: ng, glo(6), ghi(6)
+    integer :: f, lo, hi, base, flo
+    ng = 0; glo = 0; ghi = -1; base = off - 1; flo = 0
     do f = 1, 6
       lo   = base + 1
       hi   = base + nbf6(f)
@@ -786,21 +1052,9 @@ contains
         if (n(f/2) >= 2) lo = flo           ! extend the range back over the odd face
       end if
       if (hi < lo) cycle
-      active_ = .true.
-      if (.not. active_) cycle
-      !$acc parallel loop gang vector BCASYNC present(w, wr, ur, r, fm1, fm2, fm3, dl_f, m_f, yn, beta, &
-      !$acc&   bc_bi, bc_bj, bc_bk, bc_bf, bc_typ, &
-      !$acc&   bc_mach, bc_t0, bc_p0, bc_relfac, bc_alpha, bc_beta, bc_pamb, bc_ci, bc_rans, bc_tvec, bc_tw, bc_pg) &
-      !$acc&   private(Im, Jm, Km, Fm, dir, modfm, gstep, Fi, Fj, Fk, Ii, Ij, Ik, ierr, &
-      !$acc&           normal, area, Bound_Dl, Int_Dl, Ig_, Jg_, Kg_, o1_, o2_, o3_, o4_, dlc4_, &
-      !$acc&           Mrec_, Mgho_, ynrec_, yngho_, beta_)
-      do idx = lo, hi
-#include "bc_record_body.inc"
-      end do
+      ng = ng + 1; glo(ng) = lo; ghi(ng) = hi
     end do
-
-
-  end subroutine BC_Fluxes_blk
+  end subroutine bc_launch_ranges
 
 
 end module MOSE_Mod_BC

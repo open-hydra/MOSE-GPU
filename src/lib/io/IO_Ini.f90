@@ -27,6 +27,7 @@ contains
     use MOSE_Mod_RANS, only: Set_RANS_Model
     use MOSE_Lib_Soot
     use MOSE_Lib_RotatingFrame, only: obj_rot
+    use MOSE_Lib_Multirate_Base, only: obj_mr
 
     implicit none
     type(config_type), intent(inout) :: config
@@ -50,6 +51,7 @@ contains
     call obj_irs%ini_setup(fini=fini)
     call obj_prec%ini_setup(fini=fini)   ! before Assign_RS: HLLC-PC needs prec
     call obj_omega_relax%ini_setup(fini=fini)
+    call obj_mr%ini_setup(fini=fini)   ! multirate: read at start-up only (not at the runtime re-reads)
     call Stop_On_Removed_Keys ( fini )
     ! The four defaults are MOSE_open's (Lib_Ghost, Ghost_Wall_Extrapolation, Check_And_Fix_State), whatever the dialect
     call fini%get(section_name=trim(codename)//'-scheme', option_name='wall-ghost', val=wall_ghost_key, error=error)
@@ -152,9 +154,9 @@ contains
   end subroutine Read_Inifile_Runtime
 
 
-  !> Keys of the features this version does not have: multirate (branch multirate of DIMA-THRUST/MOSE), the
-  !> line-implicit operator and the IMEX integrator (last in 85e3b63 of branch mose-launcher). A run that asks for
-  !> one stops, rather than running the explicit scheme in silence; = f is accepted.
+  !> Keys of the features this version does not have: the line-implicit operator and the IMEX integrator (last in
+  !> 85e3b63 of branch mose-launcher). A run that asks for one stops, rather than running the explicit scheme in
+  !> silence; = f is accepted.
   subroutine Stop_On_Removed_Keys ( fini )
     use Finer, only: file_ini
     use MOSE_Parameters_m, only: codename
@@ -163,9 +165,6 @@ contains
     character(len=32) :: v
     integer :: error
     ! (the key names are literal: the launcher lists the keys the code reads from the source)
-    v = 'f'
-    call fini%get(section_name=trim(codename)//'-scheme', option_name='multirate', val=v, error=error)
-    if ( error == 0 ) call stop_unless_off ( 'multirate', v, 'multirate (branch multirate of DIMA-THRUST/MOSE)' )
     v = 'f'
     call fini%get(section_name=trim(codename)//'-scheme', option_name='j-implicit', val=v, error=error)
     if ( error == 0 ) call stop_unless_off ( 'j-implicit', v, 'line-implicit operator (last in 85e3b63)' )

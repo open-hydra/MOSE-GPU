@@ -25,7 +25,7 @@ module MOSE_Mod_Convective
   use MOSE_Field_m,    only: P_flat, field_block_index_params
   implicit none
   private
-  public :: Convective_Flux
+  public :: Convective_Flux, Convective_Flux_List, Convective_Flux_Pack
 
   real(R8), parameter :: Runiv = 8314.46261815324d0   ! mirror FLINT_Lib_Thermodynamic Runiv (exact SI value)
 
@@ -411,11 +411,177 @@ contains
       end do
   end subroutine conv_cuf_k
 
+  ! ---- the block-pack twins (MOSE_Pack_m): one launch per direction over the faces of every block of a batch. CUDA block
+  ! e = cb0 + blockIdx%x belongs to local block p = cbp(e) and covers the faces cbt0(e)+1 .. cbt0(e)+128 of the block's own
+  ! face range (the thread -> face decode of the per-block kernels, so the same face is computed by the same thread with
+  ! the same arithmetic). The geometry comes from the flat pools (dlp/betap by the flat cell index, fm*p by the block's
+  ! chunk offset) and the fluxes land in the batch buffer at the block's face offset tofh(d,p).
+  attributes(global) launch_bounds(128) subroutine conv_cuf_i_pack ( &
+       w, fhp, fm1p, dlp, betap, ncell, nfp, nfm, cbp, cbt0, cb0, &
+       tn1, tn2, tn3, tboff, tpi, tpj, tofm, tofh, nloc, gc, SD, limv, rsv, urf, nur )
+    integer, value :: ncell, nfp, nfm, cb0, nloc, gc, limv, rsv, nur
+    logical, value :: SD
+    real(R8) :: urf(nur)
+    real(R8) :: w(ncell, nprim), fhp(nfp, nprim)
+    real(R8) :: fm1p(4, nfm), dlp(3, ncell), betap(ncell)
+    integer  :: cbp(*), cbt0(*)
+    integer  :: tn1(nloc), tn2(nloc), tn3(nloc), tboff(nloc), tpi(nloc), tpj(nloc), tofm(nloc), tofh(3, nloc)
+    integer :: i, j, k, s, f, c0, cm1, cp1, cp2, p, e, fi, n1, n2, n3, boff, pi, pj
+    real(R8) :: dlc(-1:2), nrm(3), pm1(NPRIM_DEV), p0(NPRIM_DEV), pp1(NPRIM_DEV), pp2(NPRIM_DEV), res0(NPRIM_DEV)
+    real(R8) :: area, bet
+    integer :: t_, ni_, nj_, rem_
+    include 'conv_decls.inc'
+    e = cb0 + blockIdx%x
+    p = cbp(e)
+    n1 = tn1(p); n2 = tn2(p); n3 = tn3(p); boff = tboff(p); pi = tpi(p); pj = tpj(p)
+    t_  = cbt0(e) + threadIdx%x
+    ni_ = n1 - 1
+    nj_ = n2
+    if (t_ > ni_*nj_*n3) return
+    i    = mod(t_-1, ni_) + 1
+    rem_ = (t_-1) / ni_
+    j    = mod(rem_, nj_) + 1
+    k    = rem_ / nj_ + 1
+      c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
+      cm1 = c0 - 1; cp1 = c0 + 1; cp2 = c0 + 2
+      dlc(-1)=dlp(1,c0-1); dlc(0)=dlp(1,c0); dlc(1)=dlp(1,c0+1); dlc(2)=dlp(1,c0+2)
+      fi = tofm(p) + i + (n1+1)*((j-1) + n2*(k-1)) + 1
+      nrm(1)=fm1p(1,fi); nrm(2)=fm1p(2,fi); nrm(3)=fm1p(3,fi)
+      do s = 1, nprim
+        pm1(s)=w(cm1,s); p0(s)=w(c0,s); pp1(s)=w(cp1,s); pp2(s)=w(cp2,s)
+      end do
+      area = fm1p(4,fi); bet = betap(c0)
+      include 'conv_physics.inc'
+      f = tofh(1,p) + (i-1) + (j-1)*(n1-1) + (k-1)*(n1-1)*n2 + 1
+      do s = 1, nprim
+        fhp(f, s) = res0(s)
+      end do
+  end subroutine conv_cuf_i_pack
+
+  attributes(global) launch_bounds(128) subroutine conv_cuf_j_pack ( &
+       w, fhp, fm2p, dlp, betap, ncell, nfp, nfm, cbp, cbt0, cb0, &
+       tn1, tn2, tn3, tboff, tpi, tpj, tofm, tofh, nloc, gc, SD, limv, rsv, urf, nur )
+    integer, value :: ncell, nfp, nfm, cb0, nloc, gc, limv, rsv, nur
+    logical, value :: SD
+    real(R8) :: urf(nur)
+    real(R8) :: w(ncell, nprim), fhp(nfp, nprim)
+    real(R8) :: fm2p(4, nfm), dlp(3, ncell), betap(ncell)
+    integer  :: cbp(*), cbt0(*)
+    integer  :: tn1(nloc), tn2(nloc), tn3(nloc), tboff(nloc), tpi(nloc), tpj(nloc), tofm(nloc), tofh(3, nloc)
+    integer :: i, j, k, s, f, c0, cm1, cp1, cp2, p, e, fi, n1, n2, n3, boff, pi, pj
+    real(R8) :: dlc(-1:2), nrm(3), pm1(NPRIM_DEV), p0(NPRIM_DEV), pp1(NPRIM_DEV), pp2(NPRIM_DEV), res0(NPRIM_DEV)
+    real(R8) :: area, bet
+    integer :: t_, ni_, nj_, rem_
+    include 'conv_decls.inc'
+    e = cb0 + blockIdx%x
+    p = cbp(e)
+    n1 = tn1(p); n2 = tn2(p); n3 = tn3(p); boff = tboff(p); pi = tpi(p); pj = tpj(p)
+    t_  = cbt0(e) + threadIdx%x
+    ni_ = n1
+    nj_ = n2 - 1
+    if (t_ > ni_*nj_*n3) return
+    i    = mod(t_-1, ni_) + 1
+    rem_ = (t_-1) / ni_
+    j    = mod(rem_, nj_) + 1
+    k    = rem_ / nj_ + 1
+      c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
+      cm1 = c0 - pi; cp1 = c0 + pi; cp2 = c0 + 2*pi
+      dlc(-1)=dlp(2,c0-pi); dlc(0)=dlp(2,c0); dlc(1)=dlp(2,c0+pi); dlc(2)=dlp(2,c0+2*pi)
+      fi = tofm(p) + (i-1) + n1*(j + (n2+1)*(k-1)) + 1
+      nrm(1)=fm2p(1,fi); nrm(2)=fm2p(2,fi); nrm(3)=fm2p(3,fi)
+      do s = 1, nprim
+        pm1(s)=w(cm1,s); p0(s)=w(c0,s); pp1(s)=w(cp1,s); pp2(s)=w(cp2,s)
+      end do
+      area = fm2p(4,fi); bet = betap(c0)
+      include 'conv_physics.inc'
+      f = tofh(2,p) + (i-1) + (j-1)*n1 + (k-1)*n1*(n2-1) + 1
+      do s = 1, nprim
+        fhp(f, s) = res0(s)
+      end do
+  end subroutine conv_cuf_j_pack
+
+  attributes(global) launch_bounds(128) subroutine conv_cuf_k_pack ( &
+       w, fhp, fm3p, dlp, betap, ncell, nfp, nfm, cbp, cbt0, cb0, &
+       tn1, tn2, tn3, tboff, tpi, tpj, tofm, tofh, nloc, gc, SD, limv, rsv, urf, nur )
+    integer, value :: ncell, nfp, nfm, cb0, nloc, gc, limv, rsv, nur
+    logical, value :: SD
+    real(R8) :: urf(nur)
+    real(R8) :: w(ncell, nprim), fhp(nfp, nprim)
+    real(R8) :: fm3p(4, nfm), dlp(3, ncell), betap(ncell)
+    integer  :: cbp(*), cbt0(*)
+    integer  :: tn1(nloc), tn2(nloc), tn3(nloc), tboff(nloc), tpi(nloc), tpj(nloc), tofm(nloc), tofh(3, nloc)
+    integer :: i, j, k, s, f, c0, cm1, cp1, cp2, p, e, fi, n1, n2, n3, boff, pi, pj
+    real(R8) :: dlc(-1:2), nrm(3), pm1(NPRIM_DEV), p0(NPRIM_DEV), pp1(NPRIM_DEV), pp2(NPRIM_DEV), res0(NPRIM_DEV)
+    real(R8) :: area, bet
+    integer :: t_, ni_, nj_, rem_
+    include 'conv_decls.inc'
+    e = cb0 + blockIdx%x
+    p = cbp(e)
+    n1 = tn1(p); n2 = tn2(p); n3 = tn3(p); boff = tboff(p); pi = tpi(p); pj = tpj(p)
+    t_  = cbt0(e) + threadIdx%x
+    ni_ = n1
+    nj_ = n2
+    if (t_ > ni_*nj_*(n3-1)) return
+    i    = mod(t_-1, ni_) + 1
+    rem_ = (t_-1) / ni_
+    j    = mod(rem_, nj_) + 1
+    k    = rem_ / nj_ + 1
+      c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
+      cm1 = c0 - pi*pj; cp1 = c0 + pi*pj; cp2 = c0 + 2*pi*pj
+      dlc(-1)=dlp(3,c0-pi*pj); dlc(0)=dlp(3,c0); dlc(1)=dlp(3,c0+pi*pj); dlc(2)=dlp(3,c0+2*pi*pj)
+      fi = tofm(p) + (i-1) + n1*((j-1) + n2*k) + 1
+      nrm(1)=fm3p(1,fi); nrm(2)=fm3p(2,fi); nrm(3)=fm3p(3,fi)
+      do s = 1, nprim
+        pm1(s)=w(cm1,s); p0(s)=w(c0,s); pp1(s)=w(cp1,s); pp2(s)=w(cp2,s)
+      end do
+      area = fm3p(4,fi); bet = betap(c0)
+      include 'conv_physics.inc'
+      f = tofh(3,p) + (i-1) + (j-1)*n1 + (k-1)*n1*n2 + 1
+      do s = 1, nprim
+        fhp(f, s) = res0(s)
+      end do
+  end subroutine conv_cuf_k_pack
+
+  !> Pass 1 over the face list of one direction of a multirate level (Mod_Fluxes Fluxes_List, Lib_Multirate_Base
+  !> mr_fl_type): the face of list position e between the cells c(e) and c(e) + sa(e), its widths and metric gathered by
+  !> position, beta = 1 (the list path runs without shock detector, where the box path's beta is 1 too). The physics is
+  !> conv_physics.inc, as in conv_cuf_i/j/k: the same face value, written at the face's list position.
+  attributes(global) launch_bounds(128) subroutine conv_cuf_list ( &
+       w, fh, ne, c, sa, dlg, fmg, ncell, SD, limv, rsv, urf, nur)
+    integer, value :: ncell, ne
+    logical, value :: SD
+    integer, value :: limv   ! the limiter id (lim_dev)
+    integer, value :: rsv    ! the Riemann solver id (rs_dev)
+    integer, value :: nur    ! the size of urf: ncell with prec, 1 otherwise
+    real(R8) :: urf(nur)
+    real(R8) :: w(ncell, nprim), fh(ne, nprim)
+    integer  :: c(ne), sa(ne)
+    real(R8) :: dlg(4, ne), fmg(4, ne)
+    integer :: e, s, c0, cm1, cp1, cp2, st
+    real(R8) :: dlc(-1:2), nrm(3), pm1(NPRIM_DEV), p0(NPRIM_DEV), pp1(NPRIM_DEV), pp2(NPRIM_DEV), res0(NPRIM_DEV)
+    real(R8) :: area, bet
+    include 'conv_decls.inc'
+    e = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (e > ne) return
+      c0 = c(e); st = sa(e)
+      cm1 = c0 - st; cp1 = c0 + st; cp2 = c0 + 2*st
+      dlc(-1)=dlg(1,e); dlc(0)=dlg(2,e); dlc(1)=dlg(3,e); dlc(2)=dlg(4,e)
+      nrm(1)=fmg(1,e); nrm(2)=fmg(2,e); nrm(3)=fmg(3,e)
+      do s = 1, nprim
+        pm1(s)=w(cm1,s); p0(s)=w(c0,s); pp1(s)=w(cp1,s); pp2(s)=w(cp2,s)
+      end do
+      area = fmg(4,e); bet = 1d0
+      include 'conv_physics.inc'
+      do s = 1, nprim
+        fh(e, s) = res0(s)
+      end do
+  end subroutine conv_cuf_list
+
   ! ============================================================================
   ! HOST LAUNCHER — CUF pass-1 (host_data use_device) + OpenACC pass-2 (verbatim).
   ! Replaces Convective_Flux_w_blk when MOSE_CONV_W_CUF is ON.
   ! ============================================================================
-  subroutine Convective_Flux ( b, Res, fm1, fm2, fm3, dl, beta, n)
+  subroutine Convective_Flux ( b, Res, fm1, fm2, fm3, dl, beta, n, lo, hi )
     use MOSE_Global_m,   only: gc, nprim, nsc, nu, nv, nw, np
     use MOSE_Field_m,    only: P_flat, R_flat, field_block_index_params, ncell_total
     use MOSE_Lib_Limiters, only: SD_space_order, lim_dev
@@ -424,6 +590,7 @@ contains
     use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
     integer, intent(in) :: b
     integer, dimension(3), intent(in) :: n
+    integer, dimension(3), intent(in) :: lo, hi   ! the cells whose faces are computed: the block, or a multirate box
     real(R8), dimension(nprim, 1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(inout) :: Res
     real(R8), dimension(4, 0:n(1), n(2), n(3)), intent(in) :: fm1
     real(R8), dimension(4, n(1), 0:n(2), n(3)), intent(in) :: fm2
@@ -456,8 +623,8 @@ contains
     ! queues are per host thread, so a multi-thread driver would break the ordering.
     strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
 
-    ! ---- i-direction (flat) ----
-    o1 = 1; h1 = n1-1; o2 = 1; h2 = n2; o3 = 1; h3 = n3
+    ! ---- i-direction (flat) ----   the interior i-faces of the cells lo..hi (face i between cells i and i+1)
+    o1 = max(lo(1)-1, 1); h1 = min(hi(1), n1-1); o2 = lo(2); h2 = hi(2); o3 = lo(3); h3 = hi(3)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
@@ -470,7 +637,7 @@ contains
 
     ! ---- j-direction (flat) ----
     end if
-    o1 = 1; h1 = n1; o2 = 1; h2 = n2-1; o3 = 1; h3 = n3
+    o1 = lo(1); h1 = hi(1); o2 = max(lo(2)-1, 1); h2 = min(hi(2), n2-1); o3 = lo(3); h3 = hi(3)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
@@ -481,7 +648,7 @@ contains
 
     ! ---- k-direction ----
     end if
-    o1 = 1; h1 = n1; o2 = 1; h2 = n2; o3 = 1; h3 = n3-1
+    o1 = lo(1); h1 = hi(1); o2 = lo(2); h2 = hi(2); o3 = max(lo(3)-1, 1); h3 = min(hi(3), n3-1)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
@@ -492,6 +659,87 @@ contains
 
     end if
   end subroutine Convective_Flux
+
+  !> The convective pass 1 of batch ib of the block pack (MOSE_Pack_m): three launches, one per direction, over the faces
+  !> of every block of the batch (the pack twins of conv_cuf_i/j/k), on the sync queue's stream as Convective_Flux.
+  subroutine Convective_Flux_Pack ( ib )
+    use MOSE_Global_m,   only: gc, nprim
+    use MOSE_Field_m,    only: P_flat, ncell_total
+    use MOSE_Lib_Limiters, only: lim_dev
+    use MOSE_Lib_Riemann,  only: rs_dev
+    use MOSE_Lib_Preconditioning, only: ur_f, Prec_Alloc
+    use MOSE_Pack_m
+    use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
+    integer, intent(in) :: ib
+    integer(kind=cuda_stream_kind) :: strm
+    type(dim3) :: grid, tblock
+    integer :: limv, rsv, nur, nl
+    call cuf_init_tables()
+    call Prec_Alloc()
+    nur = size(ur_f); limv = lim_dev; rsv = rs_dev; nl = size(bt_n1)
+    strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
+    tblock = dim3(PACK_NT, 1, 1)
+    if ( pbat(ib)%ncb(1) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(1), 1, 1)
+      !$acc host_data use_device(P_flat, fhp1, fm1p, dlp, betap, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm1, bt_ofh, ur_f)
+      call conv_cuf_i_pack<<<grid,tblock,0,strm>>>(P_flat, fhp1, fm1p, dlp, betap, ncell_total, nfp1, size(fm1p,2), &
+           cb_p, cb_t0, cb_n(0,1,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm1, bt_ofh, nl, gc, .false., limv, rsv, ur_f, nur)
+      !$acc end host_data
+    end if
+    if ( pbat(ib)%ncb(2) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(2), 1, 1)
+      !$acc host_data use_device(P_flat, fhp2, fm2p, dlp, betap, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm2, bt_ofh, ur_f)
+      call conv_cuf_j_pack<<<grid,tblock,0,strm>>>(P_flat, fhp2, fm2p, dlp, betap, ncell_total, nfp2, size(fm2p,2), &
+           cb_p, cb_t0, cb_n(0,2,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm2, bt_ofh, nl, gc, .false., limv, rsv, ur_f, nur)
+      !$acc end host_data
+    end if
+    if ( pbat(ib)%ncb(3) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(3), 1, 1)
+      !$acc host_data use_device(P_flat, fhp3, fm3p, dlp, betap, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm3, bt_ofh, ur_f)
+      call conv_cuf_k_pack<<<grid,tblock,0,strm>>>(P_flat, fhp3, fm3p, dlp, betap, ncell_total, nfp3, size(fm3p,2), &
+           cb_p, cb_t0, cb_n(0,3,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm3, bt_ofh, nl, gc, .false., limv, rsv, ur_f, nur)
+      !$acc end host_data
+    end if
+  end subroutine Convective_Flux_Pack
+
+
+  !> The convective pass 1 of a multirate level on its face lists (one launch per direction, over every local block).
+  subroutine Convective_Flux_List ( fl )
+    use MOSE_Lib_Preconditioning, only: Prec_Alloc
+    use MOSE_Lib_Multirate_Base, only: mr_fl_type
+    type(mr_fl_type), intent(inout) :: fl(3)
+    integer :: d
+    call cuf_init_tables()
+    call Prec_Alloc()
+    do d = 1, 3
+      if (fl(d)%n == 0) cycle
+      call conv_list_launch ( fl(d)%fh, fl(d)%c, fl(d)%sa, fl(d)%dl, fl(d)%fm, fl(d)%n )
+    end do
+  end subroutine Convective_Flux_List
+
+  subroutine conv_list_launch ( fh, c, sa, dlg, fmg, ne )
+    use MOSE_Global_m,   only: nprim
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use MOSE_Field_m,    only: ncell_total
+    use MOSE_Lib_Limiters, only: SD_space_order, lim_dev
+    use MOSE_Lib_Riemann,  only: rs_dev
+    use MOSE_Lib_Preconditioning, only: ur_f
+    use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
+    integer,  intent(in)    :: ne, c(ne), sa(ne)
+    real(R8), intent(in)    :: dlg(4, ne), fmg(4, ne)
+    real(R8), intent(inout) :: fh(ne, nprim)
+    integer :: nur, limv, rsv
+    logical :: SD
+    integer(kind=cuda_stream_kind) :: strm
+    type(dim3) :: grid, tblock
+    nur = size(ur_f)
+    SD = SD_space_order; limv = lim_dev; rsv = rs_dev
+    tblock = dim3(128, 1, 1); grid = dim3((ne + 127)/128, 1, 1)
+    strm = acc_get_cuda_stream(int(mr_q, acc_handle_kind))   ! the stage queue's stream (mr-async; the sync queue's outside a list stage)
+    !$acc host_data use_device(P_flat, fh, c, sa, dlg, fmg, ur_f)
+    call conv_cuf_list<<<grid,tblock,0,strm>>>(P_flat, fh, ne, c, sa, dlg, fmg, ncell_total, SD, limv, rsv, ur_f, nur)
+    !$acc end host_data
+  end subroutine conv_list_launch
 
 
   ! ---- from Mod_Convective_W.f90 (MOSE_Mod_Convective) ----

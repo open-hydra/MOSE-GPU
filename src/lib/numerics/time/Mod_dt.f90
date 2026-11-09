@@ -5,7 +5,9 @@ module MOSE_Mod_dt
   use MOSE_Field_m,    only: P_flat, field_block_index_params
   implicit none
 
-  public :: Compute_dt_blk, Compute_dt_blk_mc, Dt_Anatomy_blk
+  public :: Compute_dt_blk, Compute_dt_blk_mc, Dt_Anatomy_blk, Compute_dt_cert
+  !> mr-nonlocal: the factors of this step's Compute_dt, for the certificate of the stages (Compute_dt_cert)
+  real(R8), save, public :: dt_rampa_last = 1.0_R8, dt_stiffc_last = 0.0_R8
 
 contains
 
@@ -20,13 +22,17 @@ contains
     use MOSE_Field_m, only: field_is_allocated, field_alloc, pack_P_to_flat, field_update_P_flat_device
     use MOSE_Mod_Thermo_Cache, only: Thermo_Cache_rrt_blk, Thermo_Cache_visc_blk
     use MOSE_Lib_Preconditioning, only: obj_prec, ur_f, Prec_Alloc, Update_Derived_Variables
+    use MOSE_IO_RANS, only: obj_rans
+    use MOSE_Mod_SST, only: beta_star, beta_1, beta_2
+    use MOSE_Lib_Multirate_Base, only: obj_mr
+    use MOSE_Mod_Multirate_Partition, only: MR_Partition
     implicit none
 
     type(MOSE_domain_type), intent(inout) :: domain
     type(config_type), intent(inout)      :: config
     ! Local
     integer :: i, j, k, b
-    real(R8) :: dtcell, dtglobal, rampa_fac
+    real(R8) :: dtcell, dtglobal, rampa_fac, stiffc
     logical, save :: w_init_done = .false.   ! One-time seed of resident P_flat from the IC P
     character(len=8)  :: an_env
     logical, save :: an_done = .false.       ! MOSE_DT_ANAT: one-shot per-direction dt anatomy
@@ -62,6 +68,17 @@ contains
     ! every state update (Mod_Explicit); ur_f has one element otherwise
     call Prec_Alloc ()
     if ( obj_prec%enabled ) call Update_Derived_Variables ( domain, .true. )
+    ! dt-rule = additive (MOSE_open main): with explicit turbulence sources (time-accurate, point-implicit = false) the
+    ! bound of their stiffness enters the step, SST only: max(beta*, 2 max(beta_1, beta_2)) omega (SST_Stiffness_Bound)
+    stiffc = 0d0
+    if ( config%dt_additive ) then
+      if ( ndir /= 3 ) error stop 'dt-rule = additive: ported for 3-D meshes only (the wedge term of MOSE_open is not on the GPU)'
+      if ( RANS .and. config%time_accurate .and. .not. obj_rans%point_implicit ) then
+        if ( eddy_dev /= 1 ) error stop 'dt-rule = additive with explicit turbulence sources: the stiffness bound is ported for SST only'
+        stiffc = max ( beta_star, 2d0 * max ( beta_1, beta_2 ) )
+      end if
+    end if
+    dt_rampa_last = rampa_fac; dt_stiffc_last = stiffc   ! mr-nonlocal: the same factors for the certificate
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle
       call Thermo_Cache_rrt_blk ( b, domain%blk(b)%dim, 1, domain%blk(b)%dim(1),   &
@@ -74,15 +91,19 @@ contains
       call Compute_dt_blk_mc ( b, domain%blk(b)%m_f, domain%blk(b)%dl_f,            &
              domain%blk(b)%rho_c, domain%blk(b)%Rg_c, domain%blk(b)%mil_c,            &
              domain%blk(b)%dtlocal, domain%blk(b)%dim, config%cfl, config%vnn,        &
-             rampa_fac, dtglobal, ur_f, size(ur_f), obj_prec%enabled, vnn_diff, sct_dev )
+             rampa_fac, dtglobal, ur_f, size(ur_f), obj_prec%enabled,                 &
+             config%dt_additive, stiffc, vnn_diff, sct_dev )
       else
       call Compute_dt_blk ( b, domain%blk(b)%m_f, domain%blk(b)%dl_f,               &
              domain%blk(b)%rho_c, domain%blk(b)%Rg_c, domain%blk(b)%mil_c,            &
              domain%blk(b)%dtlocal, domain%blk(b)%dim, config%cfl, config%vnn,        &
-             rampa_fac, dtglobal, ur_f, size(ur_f), obj_prec%enabled )
+             rampa_fac, dtglobal, ur_f, size(ur_f), obj_prec%enabled,                 &
+             config%dt_additive, stiffc )
       end if
     end do
     call mpi_allreduce_min_r8(dtglobal, domain % dtglobal)
+    ! multirate (t or census): the levels from these per-cell limits; with t the macro step replaces dtglobal
+    if ( obj_mr%active .and. config%time_accurate ) call MR_Partition ( domain, config )
     ! MOSE_DT_ANAT=<n>: at the n-th Compute_dt call, the per-direction ingredients of every cell's
     ! limit (diagnostic only). OUTPUT/dtanat_r<rank>.bin: per local block int32 b, n(3), then
     ! real32 an(1:6,:,:,:) = convective times dl/lambda (3) and viscous times rho dl^2/mu (3), then an(13) = hr_c.
@@ -145,7 +166,11 @@ contains
         if ( mcdiff_dev ) close(an_m)
       end if
     end if
-    call Clip_dt_To_Timemax ( domain, config )
+    if ( obj_mr%drive .and. obj_mr%land .and. config%time_accurate ) then
+      call MR_Land ( domain, config )   ! mr-land: the macro step ends on k sol-dtime or on time-threshold
+    else
+      call Clip_dt_To_Timemax ( domain, config )
+    end if
     return
     contains
 
@@ -218,6 +243,39 @@ contains
   end subroutine Compute_dt
 
 
+  !> mr-land (open-hydra MOSE feature/multirate-integrator, Mod_Multirate.f90 619-638 there): after the partition, the
+  !> macro step H = dtglobal is cut to end on the next output instant t_k = k sol-dtime (the smallest above the time; k
+  !> integer, the product in double precision, the grid anchored at t = 0) or on time-threshold, whichever is nearer; a
+  !> step that would end within 1e-12 H of it ends there (no step of a few units in the last place afterwards). The level
+  !> map of the step is kept: every sub-step H/2**lev only shrinks (or grows by at most 1e-12 H), so every cell stays
+  !> within its limit; obj_mr%H, Hbuilt and Hreqb keep the uncut step for the light-step test. Explicit_Step then assigns
+  !> the time t_land; mr_output_landed triggers the time-based output.
+  subroutine MR_Land ( domain, config )
+    use MOSE_Types_m
+    use MOSE_IO_Solution,        only: obj_io
+    use MOSE_Lib_Multirate_Base, only: mr_landed, mr_output_landed, mr_t_land
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    type(config_type), intent(in)         :: config
+    real(R8) :: H, kout, tk, t_land
+    mr_landed = .false.; mr_output_landed = .false.
+    if ( .not. ( obj_io%sol_dtime > 0.0_R8 ) ) return
+    H = domain%dtglobal
+    kout = aint(domain%time / obj_io%sol_dtime) + 1.0_R8
+    if ((kout - 1.0_R8) * obj_io%sol_dtime > domain%time) kout = kout - 1.0_R8
+    if (kout * obj_io%sol_dtime <= domain%time) kout = kout + 1.0_R8
+    tk = kout * obj_io%sol_dtime
+    t_land = tk
+    if (config%timemax > domain%time) t_land = min(t_land, config%timemax)
+    mr_landed = domain%time + H >= t_land - 1.0e-12_R8 * H
+    if (mr_landed) then
+      domain%dtglobal = t_land - domain%time
+      mr_t_land = t_land
+      mr_output_landed = (t_land == tk)
+    end if
+  end subroutine MR_Land
+
+
   !> time-clip: shorten the global dt so that the step lands exactly on
   !> time-threshold (same-time field comparisons against an oracle). Off by
   !> default; only in time-accurate runs. The 1e-12 overshoot makes the
@@ -249,11 +307,19 @@ contains
   subroutine Set_Global_dt ( domain )
     use MOSE_Types_m
     use MOSE_Mod_MPI, only: is_local_block
+    use MOSE_Lib_Multirate_Base, only: obj_mr
+    use MOSE_Mod_Multirate_Partition, only: MR_Set_Local_dt
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
     ! Local
     integer :: b, i, j, k
+
+    ! multirate = t: each cell's own sub-step, the macro step / 2**level
+    if ( obj_mr%drive ) then
+      call MR_Set_Local_dt ( domain )
+      return
+    end if
 
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle
@@ -311,6 +377,62 @@ contains
 #include "dt_blk.inc"
 #undef DTW_NAME
 #undef MOSE_MCDIFF_KERNEL
+! mr-nonlocal: the same routine without the write of the flat twin dt_f (the certificate must not change the run)
+#define MOSE_DT_NOTWIN
+#define DTW_NAME Compute_dt_cert_blk
+#include "dt_blk.inc"
+#undef DTW_NAME
+#undef MOSE_DT_NOTWIN
+
+
+  !> mr-nonlocal (open-hydra MOSE feature/multirate-integrator, Dtcap_Cell, Mod_Multirate.f90 1174-1305 there): the
+  !> admissible step of every cell of block b at the current state P_flat into dtc, by the kernel of Compute_dt
+  !> (Compute_dt_cert_blk = Compute_dt_blk without the flat twin) with this step's factors (dt_rampa_last,
+  !> dt_stiffc_last). The thermo values go to the scratch rho_s, Rg_s, T_s, mil_s (the same statements as
+  !> Thermo_Cache_rrt_blk / _visc_blk, without the caches and their flat twins): the run does not change. Synchronous.
+  subroutine Compute_dt_cert ( domain, config, b, rho_s, Rg_s, T_s, mil_s, dtc )
+    use MOSE_Types_m
+    use MOSE_Field_m, only: P_flat, field_block_index_params
+    use MOSE_Lib_Preconditioning, only: obj_prec, ur_f
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, co_mi_lam_Wilke_dev
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    type(config_type),      intent(in)    :: config
+    integer, intent(in) :: b
+    real(R8), dimension(1-gc:domain%blk(b)%dim(1)+gc, 1-gc:domain%blk(b)%dim(2)+gc, 1-gc:domain%blk(b)%dim(3)+gc), &
+      intent(inout) :: rho_s, Rg_s, T_s, mil_s
+    real(R8), intent(inout) :: dtc(domain%blk(b)%dim(1), domain%blk(b)%dim(2), domain%blk(b)%dim(3))
+    integer  :: i, j, k, s, c0, boff, pi, pj, n1, n2, n3, T_i, Tint(2)
+    real(R8) :: rho, Rg, T, Tdiff, mil, rl(nsc), dtg
+    logical  :: visc_
+    call field_block_index_params ( b, boff, pi, pj )
+    n1 = domain%blk(b)%dim(1); n2 = domain%blk(b)%dim(2); n3 = domain%blk(b)%dim(3); visc_ = VISC
+    !$acc parallel loop collapse(3) gang vector present(P_flat, rho_s, Rg_s, T_s, mil_s) &
+    !$acc&  private(rl, rho, Rg, T, T_i, Tdiff, Tint, mil, c0, s)
+    do k = 1, n3
+    do j = 1, n2
+    do i = 1, n1
+      c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
+      do s = 1, nsc
+        rl(s) = P_flat(c0,s)
+      end do
+      call co_rotot_Rtot_dev ( rl(1:nsc), rho, Rg )
+      rho_s(i,j,k) = rho
+      Rg_s (i,j,k) = Rg
+      T_s  (i,j,k) = P_flat(c0,np) / ( rho * Rg )
+      if ( visc_ ) then
+        T = T_s(i,j,k)
+        T_i = idint(T); Tdiff = T - T_i
+        Tint(1) = T_i; Tint(2) = T_i + 1
+        call co_mi_lam_Wilke_dev ( rl(1:nsc), rho, Tint, Tdiff, mil )
+        mil_s(i,j,k) = mil
+      end if
+    end do; end do; end do
+    dtg = huge(1.0_R8)
+    call Compute_dt_cert_blk ( b, domain%blk(b)%m_f, domain%blk(b)%dl_f, rho_s, Rg_s, mil_s, dtc, domain%blk(b)%dim, &
+           config%cfl, config%vnn, dt_rampa_last, dtg, ur_f, size(ur_f), obj_prec%enabled, config%dt_additive, &
+           dt_stiffc_last )
+  end subroutine Compute_dt_cert
 
   !> Diagnostic (MOSE_DT_ANAT, the non-preconditioned speeds also with prec): the ingredients of Compute_dt_blk's limit, per cell and per
   !> direction, WITHOUT the cfl/vnn factors:

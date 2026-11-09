@@ -2,15 +2,33 @@
 ! per-block kernels (which derive them from their own arrays) and by the fused kernel (which reads
 ! them from the per-level gather), so the two paths cannot drift.
         select case (bc_typ(idx))
-          case (1, 666)   ! connection & chimera (donor data already in the receiver ghosts / bc_pg;
+          case (1, 666, 667)   ! connection & chimera (donor data already in the receiver ghosts / bc_pg;
                           ! chimera ghosts filled by Ghost_Chimera -- host BC_Fluxes routes 666
-                          ! through the connection twins identically)
-            call BC_Connection_Eul ( PWARG, r, beta_, dlc4_, nb1_, nb2_, nb3_, &
-                                         Im, Jm, Km, Fm, normal, area )
-            if (VISC) &
-              call BC_Connection_Visc ( PWARG, r, Mrec_, Mgho_, &
-                                            ynrec_, yngho_, bc_pg(:,:,idx), &
-                                            nb1_, nb2_, nb3_, Im, Jm, Km, Fm, normal, area )
+                          ! through the connection twins identically); 667 = MOSE_open 410, the ghost of the
+                          ! file (Ghost_Q2D_Layers/_Edges) and the Riemann flux of the connection, as MOSE_open
+            ! mr-conn-fast (Lib_BC conn_fast_dev): 2 lean (default), 1 the face state once, 0 as before -- the same operations
+            if (conn_fast_dev == 2) then
+              call BC_Connection_Eul_lean ( PWARG, r, beta_, dlc4_, nb1_, nb2_, nb3_, &
+                                            Im, Jm, Km, Fm, normal, area )
+            else
+              call BC_Connection_Eul ( PWARG, r, beta_, dlc4_, nb1_, nb2_, nb3_, &
+                                           Im, Jm, Km, Fm, normal, area )
+            end if
+            if (VISC) then
+              if (conn_fast_dev == 2) then
+                call BC_Connection_Visc_lean ( PWARG, r, Mrec_, Mgho_, &
+                                               ynrec_, yngho_, bc_pg(:,:,idx), &
+                                               nb1_, nb2_, nb3_, Im, Jm, Km, Fm, normal, area )
+              else if (conn_fast_dev == 1) then
+                call BC_Connection_Visc_fast ( PWARG, r, Mrec_, Mgho_, &
+                                               ynrec_, yngho_, bc_pg(:,:,idx), &
+                                               nb1_, nb2_, nb3_, Im, Jm, Km, Fm, normal, area )
+              else
+                call BC_Connection_Visc ( PWARG, r, Mrec_, Mgho_, &
+                                              ynrec_, yngho_, bc_pg(:,:,idx), &
+                                              nb1_, nb2_, nb3_, Im, Jm, Km, Fm, normal, area )
+              end if
+            end if
           case (2)   ! rotational periodicity (wedge seam, faces 5-6; reads block-own
                      ! opposite-k cells + rotates donor (v,w) by delthe — no ghost)
             call BC_Rotational_Periodic_Eul ( PWARG, r, dl_f, nb1_, nb2_, nb3_, &

@@ -149,6 +149,42 @@ module MOSE_Mod_GhostExchange
   !> update device on the slab buffers) on a machine whose MPI is not CUDA-aware, with no rebuild.
   logical, public :: gpu_aware_mpi_runtime = .true.
 
+  !> Level-restricted exchange (multirate, mr-xch): a stage of level l ships only the entries whose ghost rows the
+  !> stage reads (Mod_Multirate_Partition mr_build_xch_masks: the receiver's boxes of the level grown by gc, the rule of
+  !> mr_build_ghost_list). The receiver's mask travels to the donor once per full partition (levels are frozen between
+  !> them); both sides keep the same compact sub-list per level in the same rank-sorted order, so the per-peer messages
+  !> pair up exactly as in the full exchange. The sub-list packs at compact positions of the SAME resident P / Pg
+  !> buffers; its messages are non-persistent MPI_Isend / Irecv with the level's counts and their own tags.
+  !> xch_level < 0 (outside the multirate stages: the explicit step, the setup, the dumps) = the full exchange.
+  type :: xch_lvl_type
+    integer :: ns = 0, nr = 0, nsg = 0, nrg = 0, ng = 0
+    integer, allocatable :: sidx(:), ridx(:)                     !< compact entry lists of P (device-resident)
+    integer, allocatable :: sidxg(:), ridxg(:), gidx(:)          !< the same for Pg shipped, and the Pg gathered entries
+    integer, allocatable :: scnt(:), soff(:), rcnt(:), roff(:)   !< per peer group: entries, first compact position (P)
+    integer, allocatable :: scntg(:), soffg(:), rcntg(:), roffg(:) !< the same for Pg
+    integer, allocatable :: sreq(:), rreq(:), sreqg(:), rreqg(:) !< MPI requests: P send / recv, Pg send / recv
+  end type xch_lvl_type
+  !> Pg at the face edges only (pg-edge): the receiver rebuilds the transverse stencil bc_pg(:,3:6) of an entry from its
+  !> own ghost P when the donor's four tangential neighbours are first-row donor cells of entries this rank receives (the
+  !> same numbers the donor would pack, shipped with P); Pg is shipped only for the other entries (face edges, split
+  !> faces, donor ghosts). On the level sub-lists an entry is gathered only when its four neighbours are in the level's P
+  !> sub-list, else shipped. MOSE_PG_EDGE=0 keeps the full Pg exchange.
+  type :: pgx_type
+    logical :: on = .false.
+    integer :: ns = 0, nr = 0, ng = 0                           !< shipped send / recv entries, gathered recv entries
+    integer, allocatable :: sidx(:), ridx(:), gidx(:)           !< device-resident
+    integer, allocatable :: scnt(:), soff(:), rcnt(:), roff(:)  !< per peer group
+    integer, allocatable :: nbr(:,:)                            !< (4, n_recv) the neighbour's recv entry (0 = none), host
+    integer, allocatable :: gcell(:,:)                          !< (4, n_recv) flat P index of the neighbour's ghost, device
+  end type pgx_type
+  type(pgx_type), save :: pgx
+  integer, allocatable, save :: xch_own(:)   !< flat index of a receive entry's two ghost cells -> the entry (0 = none)
+  type(xch_lvl_type), allocatable, save :: xl(:)   !< (0:xch_nlev-1)
+  integer, public, save :: xch_level = -1          !< the level of the exchange in flight (-1 = the full exchange)
+  integer, save :: xch_nlev = 0
+  integer, save :: xch_env = -1                    !< MOSE_MR_XCH=0 in the environment keeps the full exchange
+  public :: ghost_sched_set_level_masks, xch_set_level, xch_level_count, fill_bc_pg_transverse, xch_lazy_setup
+
   public :: build_ghost_schedule
   public :: build_local_bc_index
   public :: cleanup_ghost_schedule
@@ -178,6 +214,7 @@ contains
   subroutine build_ghost_schedule(domain)
     use MOSE_Types_m
     use MOSE_Global_m, only: gc, nprim
+    use MOSE_Mod_MPI, only: mpi_rank_
 
     implicit none
     type(MOSE_domain_type), intent(in) :: domain
@@ -298,6 +335,10 @@ contains
         allocate(ghost_sched%send_req(max(ghost_sched%n_send_ranks,1)))
         allocate(ghost_sched%recv_req(max(ghost_sched%n_recv_ranks,1)))
         allocate(ghost_sched%mpi_stat(MPI_STATUS_SIZE, max_ranks))
+        write(*,'(A,I4,A,I0,A,I0,A,I0,A,I0,A,F8.1,A,F8.1,A)') ' [halo] rank ', mpi_rank_, ': send cells ', ns, &
+          ', recv cells ', nr, ', peer ranks ', ghost_sched%n_send_ranks, ' / ', ghost_sched%n_recv_ranks, &
+          '; P buffers ', real(nprim*gc,8)*real(ns+nr,8)*8.0d0/1048576.0d0, ' MB, Pg buffers ', &
+          real(nprim*4,8)*real(ns+nr,8)*8.0d0/1048576.0d0, ' MB (per exchange)'
       end block
     end if
 
@@ -414,6 +455,68 @@ contains
 #endif
   end subroutine cleanup_ghost_schedule
 
+  !> mr-xch: the receiver-side bit masks (bit l = a stage of level l reads the entry) for nlev levels -> the per-level
+  !> sub-lists on both sides. Frees the previous ones. No-op on one rank / in the CPU build / with MOSE_MR_XCH=0.
+  subroutine ghost_sched_set_level_masks ( domain, rmask, cmask, nlev )
+    use MOSE_Types_m
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    integer, intent(in) :: rmask(:), cmask(:), nlev   !< per receive entry, per same-rank connection record (bit l)
+    xch_level = -1
+#ifdef USE_MPI
+    call xch_build_levels ( domain, rmask, cmask, nlev )
+#endif
+  end subroutine ghost_sched_set_level_masks
+
+  !> mr-xch: the exchange that follows ships the sub-list of level l (l < 0, or no sub-lists: the full exchange).
+  subroutine xch_set_level ( l )
+    implicit none
+    integer, intent(in) :: l
+    xch_level = -1
+    if ( l < 0 .or. l >= xch_nlev ) return
+    if ( .not. allocated(xl) ) return
+    xch_level = l
+  end subroutine xch_set_level
+
+  !> mr-xch: the entries of the sub-list of level l on this rank (send, receive).
+  subroutine xch_level_count ( l, ns, nr, nsg, nrg )
+    implicit none
+    integer, intent(in)  :: l
+    integer, intent(out) :: ns, nr, nsg, nrg
+    ns = 0; nr = 0; nsg = 0; nrg = 0
+    if ( .not. allocated(xl) ) return
+    if ( l < 0 .or. l > ubound(xl,1) ) return
+    ns = xl(l)%ns; nr = xl(l)%nr; nsg = xl(l)%nsg; nrg = xl(l)%nrg
+  end subroutine xch_level_count
+
+  !> pg-edge: bc_pg(:,3:6) of the gathered entries from the receiver's own ghost P (after the P unpack, same queue).
+  subroutine fill_bc_pg_transverse ( domain, async_q )
+    use MOSE_Types_m
+    use openacc, only: acc_async_sync
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    integer, intent(in), optional :: async_q
+#ifdef USE_MPI
+    integer :: q
+    if ( mpi_size_ <= 1 ) return
+    if ( .not. pgx%on ) return
+    q = acc_async_sync
+    if ( present(async_q) ) q = async_q
+    block
+      use MOSE_Field_m, only: P_flat, ncell_total
+      if ( xch_level >= 0 ) then
+        if ( xl(xch_level)%ng > 0 ) &
+          call fill_bc_pg_transverse_lst ( P_flat, ncell_total, domain % bc_pg, domain % nbound, xl(xch_level)%ng, &
+                                           xl(xch_level)%gidx, ghost_sched%n_recv, pgx%gcell, ghost_sched%pg_recv_slot, q )
+      else
+        if ( pgx%ng > 0 ) &
+          call fill_bc_pg_transverse_lst ( P_flat, ncell_total, domain % bc_pg, domain % nbound, pgx%ng, pgx%gidx, &
+                                           ghost_sched%n_recv, pgx%gcell, ghost_sched%pg_recv_slot, q )
+      end if
+    end block
+#endif
+  end subroutine fill_bc_pg_transverse
+
 
 #ifdef USE_MPI
   !> Build flat per-entry index tables that mirror send_list/recv_list in
@@ -524,7 +627,7 @@ contains
       use MOSE_Global_m, only: nprim
       use mpi
       integer :: i, nr, bidx, slot
-      integer :: r, ierr, tag, buf_pos, entry_size
+      integer :: r, ierr, tag, buf_pos, entry_size, cnt_r
       integer, parameter :: PG_NCOLS = 4
       integer, allocatable :: slot_of(:)
 
@@ -550,7 +653,22 @@ contains
 
       !$acc enter data copyin(ghost_sched%pg_recv_slot)
       ghost_sched%pg_tables_built = .true.
+      ! xch_build_own / pgx_build need the flat field tables (field_alloc, inside the time loop): xch_lazy_setup
 
+      call init_persistent_Pg_requests()
+    end block
+#endif
+  end subroutine finalize_pg_tables
+
+#ifdef USE_MPI
+  !> The persistent Pg requests (mirror init_persistent_P_requests, distinct tags); on the compact pg-edge lists when
+  !> pgx is on (re-initialised by xch_lazy_setup after pgx_build).
+  subroutine init_persistent_Pg_requests()
+    use MOSE_Global_m, only: nprim
+    use mpi
+    implicit none
+    integer :: r, ierr, tag, buf_pos, entry_size, cnt_r
+    integer, parameter :: PG_NCOLS = 4
       ! ---- persistent Pg requests (mirror init_persistent_P_requests, distinct tags) ----
       if (ghost_sched%n_send == 0 .and. ghost_sched%n_recv == 0) return
       entry_size = nprim * PG_NCOLS
@@ -563,10 +681,14 @@ contains
       if (ghost_sched%dev_bound .and. ghost_sched%pg_bufs_resident) then
         do r = 1, ghost_sched%n_recv_ranks
           buf_pos = (ghost_sched%recv_groups(r)%offset - 1) * entry_size + 1
+          cnt_r = ghost_sched%recv_groups(r)%count
+          if (pgx%on) then   ! pg-edge: the shipped entries only
+            buf_pos = (pgx%roff(r) - 1) * entry_size + 1; cnt_r = pgx%rcnt(r)
+          end if
           tag = ghost_sched%recv_groups(r)%rank + 20000
           !$acc host_data use_device(ghost_sched%Pg_recv_buf)
           call MPI_RECV_INIT(ghost_sched%Pg_recv_buf(buf_pos), &
-                             ghost_sched%recv_groups(r)%count * entry_size, &
+                             cnt_r * entry_size, &
                              MPI_DOUBLE_PRECISION, ghost_sched%recv_groups(r)%rank, tag, &
                              MPI_COMM_WORLD, ghost_sched%Pg_recv_req_pers(r), ierr)
           !$acc end host_data
@@ -574,10 +696,14 @@ contains
         end do
         do r = 1, ghost_sched%n_send_ranks
           buf_pos = (ghost_sched%send_groups(r)%offset - 1) * entry_size + 1
+          cnt_r = ghost_sched%send_groups(r)%count
+          if (pgx%on) then   ! pg-edge: the shipped entries only
+            buf_pos = (pgx%soff(r) - 1) * entry_size + 1; cnt_r = pgx%scnt(r)
+          end if
           tag = mpi_rank_ + 20000
           !$acc host_data use_device(ghost_sched%Pg_send_buf)
           call MPI_SEND_INIT(ghost_sched%Pg_send_buf(buf_pos), &
-                             ghost_sched%send_groups(r)%count * entry_size, &
+                             cnt_r * entry_size, &
                              MPI_DOUBLE_PRECISION, ghost_sched%send_groups(r)%rank, tag, &
                              MPI_COMM_WORLD, ghost_sched%Pg_send_req_pers(r), ierr)
           !$acc end host_data
@@ -590,26 +716,76 @@ contains
       ! Host-bound persistent Pg requests (CPU build / GPU host-staging fallback).
       do r = 1, ghost_sched%n_recv_ranks
         buf_pos = (ghost_sched%recv_groups(r)%offset - 1) * entry_size + 1
+        cnt_r = ghost_sched%recv_groups(r)%count
+        if (pgx%on) then   ! pg-edge: the shipped entries only
+          buf_pos = (pgx%roff(r) - 1) * entry_size + 1; cnt_r = pgx%rcnt(r)
+        end if
         tag = ghost_sched%recv_groups(r)%rank + 20000
         call MPI_RECV_INIT(ghost_sched%Pg_recv_buf(buf_pos), &
-                           ghost_sched%recv_groups(r)%count * entry_size, &
+                           cnt_r * entry_size, &
                            MPI_DOUBLE_PRECISION, ghost_sched%recv_groups(r)%rank, tag, &
                            MPI_COMM_WORLD, ghost_sched%Pg_recv_req_pers(r), ierr)
         call check_mpi_error(ierr)
       end do
       do r = 1, ghost_sched%n_send_ranks
         buf_pos = (ghost_sched%send_groups(r)%offset - 1) * entry_size + 1
+        cnt_r = ghost_sched%send_groups(r)%count
+        if (pgx%on) then   ! pg-edge: the shipped entries only
+          buf_pos = (pgx%soff(r) - 1) * entry_size + 1; cnt_r = pgx%scnt(r)
+        end if
         tag = mpi_rank_ + 20000
         call MPI_SEND_INIT(ghost_sched%Pg_send_buf(buf_pos), &
-                           ghost_sched%send_groups(r)%count * entry_size, &
+                           cnt_r * entry_size, &
                            MPI_DOUBLE_PRECISION, ghost_sched%send_groups(r)%rank, tag, &
                            MPI_COMM_WORLD, ghost_sched%Pg_send_req_pers(r), ierr)
         call check_mpi_error(ierr)
       end do
       ghost_sched%persistent_Pg_init = .true.
-    end block
+  end subroutine init_persistent_Pg_requests
+
+  subroutine free_persistent_Pg_requests()
+    use mpi
+    implicit none
+    integer :: r, ierr
+    if (.not. ghost_sched%persistent_Pg_init) return
+    do r = 1, ghost_sched%n_send_ranks
+      call MPI_REQUEST_FREE(ghost_sched%Pg_send_req_pers(r), ierr)
+    end do
+    do r = 1, ghost_sched%n_recv_ranks
+      call MPI_REQUEST_FREE(ghost_sched%Pg_recv_req_pers(r), ierr)
+    end do
+    deallocate(ghost_sched%Pg_send_req_pers, ghost_sched%Pg_recv_req_pers)
+    ghost_sched%persistent_Pg_init = .false.
+  end subroutine free_persistent_Pg_requests
 #endif
-  end subroutine finalize_pg_tables
+
+  !> The tables that need the flat field (blk_off, ncell_total: field_alloc runs inside the time loop, after the setup
+  !> that builds the schedule): the ghost-cell owner table of the level masks and the pg-edge lists, once, at the first
+  !> multi-rank ghost fill that finds the field allocated. Collective (pgx_build ships a mask).
+  subroutine xch_lazy_setup ( domain )
+    use MOSE_Types_m
+    use MOSE_Field_m, only: field_is_allocated
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    logical, save :: done = .false.
+    if ( done ) return
+    if ( mpi_size_ <= 1 ) then
+      done = .true.; return
+    end if
+#ifdef USE_MPI
+    if ( .not. ghost_sched%pg_tables_built ) return
+    if ( .not. field_is_allocated() ) return
+    done = .true.
+    call xch_build_own ( )
+    call pgx_build ( domain )
+    if ( pgx%on ) then
+      call free_persistent_Pg_requests()
+      call init_persistent_Pg_requests()
+    end if
+#else
+    done = .true.
+#endif
+  end subroutine xch_lazy_setup
 
 
 #ifdef USE_MPI
@@ -1337,6 +1513,9 @@ contains
     use mpi
     implicit none
     integer :: ierr
+    if (xch_level >= 0) then
+      call xch_P_post_recv(xch_level); return
+    end if
 
     if (ghost_sched%n_send == 0 .and. ghost_sched%n_recv == 0) return
     if (ghost_sched%n_recv_ranks > 0) then
@@ -1352,6 +1531,9 @@ contains
     use mpi
     implicit none
     integer :: ierr
+    if (xch_level >= 0) then
+      call xch_P_post_send(xch_level); return
+    end if
 
     if (ghost_sched%n_send == 0 .and. ghost_sched%n_recv == 0) return
     if (ghost_sched%n_send_ranks > 0) then
@@ -1366,6 +1548,9 @@ contains
     use mpi
     implicit none
     integer :: ierr
+    if (xch_level >= 0) then
+      call xch_P_wait_recv(xch_level); return
+    end if
 
     if (ghost_sched%n_send == 0 .and. ghost_sched%n_recv == 0) return
     if (ghost_sched%n_recv_ranks > 0) then
@@ -1382,6 +1567,9 @@ contains
     use mpi
     implicit none
     integer :: ierr
+    if (xch_level >= 0) then
+      call xch_P_wait_send(xch_level); return
+    end if
 
     if (ghost_sched%n_send == 0 .and. ghost_sched%n_recv == 0) return
     if (ghost_sched%n_send_ranks > 0) then
@@ -1419,10 +1607,18 @@ contains
     if (present(async_q)) then
       block
         use MOSE_Field_m, only: P_flat, ncell_total, dboff, dpi, dpj
+        if (xch_level >= 0) then   ! mr-xch: the sub-list of the level
+          if (xl(xch_level)%ns > 0) &
+            call exchange_P_pack_lst(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), xl(xch_level)%ns, xl(xch_level)%sidx, &
+                                     ghost_sched%n_send, size(ghost_sched%P_send_buf), ghost_sched%P_send_buf, ghost_sched%send_b, &
+                                     ghost_sched%send_is, ghost_sched%send_js, ghost_sched%send_ks, &
+                                     ghost_sched%send_di, ghost_sched%send_dj, ghost_sched%send_dk, async_q)
+        else
         call exchange_P_pack_all(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), ghost_sched%n_send, &
                                    size(ghost_sched%P_send_buf), ghost_sched%P_send_buf, ghost_sched%send_b, &
                                    ghost_sched%send_is, ghost_sched%send_js, ghost_sched%send_ks, &
                                    ghost_sched%send_di, ghost_sched%send_dj, ghost_sched%send_dk, async_q)
+        end if
       end block
       return
     end if
@@ -1484,10 +1680,18 @@ contains
     if (present(async_q)) then
       block
         use MOSE_Field_m, only: P_flat, ncell_total, dboff, dpi, dpj
+        if (xch_level >= 0) then   ! mr-xch: the sub-list of the level
+          if (xl(xch_level)%nr > 0) &
+            call exchange_P_unpack_lst(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), xl(xch_level)%nr, xl(xch_level)%ridx, &
+                                       ghost_sched%n_recv, size(ghost_sched%P_recv_buf), ghost_sched%P_recv_buf, ghost_sched%recv_b, &
+                                       ghost_sched%recv_id, ghost_sched%recv_jd, ghost_sched%recv_kd, &
+                                       ghost_sched%recv_di, ghost_sched%recv_dj, ghost_sched%recv_dk, async_q)
+        else
         call exchange_P_unpack_all(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), ghost_sched%n_recv, &
                                      size(ghost_sched%P_recv_buf), ghost_sched%P_recv_buf, ghost_sched%recv_b, &
                                      ghost_sched%recv_id, ghost_sched%recv_jd, ghost_sched%recv_kd, &
                                      ghost_sched%recv_di, ghost_sched%recv_dj, ghost_sched%recv_dk, async_q)
+        end if
       end block
       return
     end if
@@ -1607,11 +1811,27 @@ contains
     if (present(async_q)) then
       block
         use MOSE_Field_m, only: P_flat, ncell_total, dboff, dpi, dpj
+        if (xch_level >= 0) then   ! mr-xch: the Pg sub-list of the level
+          if (xl(xch_level)%nsg > 0) &
+            call exchange_Pg_pack_lst(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), xl(xch_level)%nsg, xl(xch_level)%sidxg, &
+                                      ghost_sched%n_send, size(ghost_sched%Pg_send_buf), ghost_sched%Pg_send_buf, ghost_sched%send_b, &
+                                      ghost_sched%send_is, ghost_sched%send_js, ghost_sched%send_ks, &
+                                      ghost_sched%pg_send_fs, ghost_sched%pg_send_d11, ghost_sched%pg_send_d12, &
+                                      ghost_sched%pg_send_d21, ghost_sched%pg_send_d22, async_q)
+        else if (pgx%on) then      ! pg-edge: the shipped entries
+          if (pgx%ns > 0) &
+            call exchange_Pg_pack_lst(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), pgx%ns, pgx%sidx, &
+                                      ghost_sched%n_send, size(ghost_sched%Pg_send_buf), ghost_sched%Pg_send_buf, ghost_sched%send_b, &
+                                      ghost_sched%send_is, ghost_sched%send_js, ghost_sched%send_ks, &
+                                      ghost_sched%pg_send_fs, ghost_sched%pg_send_d11, ghost_sched%pg_send_d12, &
+                                      ghost_sched%pg_send_d21, ghost_sched%pg_send_d22, async_q)
+        else
         call exchange_Pg_pack_all(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), ghost_sched%n_send, &
                                     size(ghost_sched%Pg_send_buf), ghost_sched%Pg_send_buf, ghost_sched%send_b, &
                                     ghost_sched%send_is, ghost_sched%send_js, ghost_sched%send_ks, &
                                     ghost_sched%pg_send_fs, ghost_sched%pg_send_d11, ghost_sched%pg_send_d12, &
                                     ghost_sched%pg_send_d21, ghost_sched%pg_send_d22, async_q)
+        end if
       end block
       return
     end if
@@ -1688,6 +1908,18 @@ contains
     q = acc_async_sync
     if (present(async_q)) q = async_q
     if (ghost_sched%n_recv == 0) return
+    if (xch_level >= 0) then   ! mr-xch: the Pg sub-list of the level
+      if (xl(xch_level)%nrg > 0) &
+        call exchange_Pg_unpack_lst(domain % bc_pg, domain % nbound, xl(xch_level)%nrg, xl(xch_level)%ridxg, ghost_sched%n_recv, &
+                                    size(ghost_sched%Pg_recv_buf), ghost_sched%Pg_recv_buf, ghost_sched%pg_recv_slot, q)
+      return
+    end if
+    if (pgx%on) then           ! pg-edge: the shipped entries
+      if (pgx%nr > 0) &
+        call exchange_Pg_unpack_lst(domain % bc_pg, domain % nbound, pgx%nr, pgx%ridx, ghost_sched%n_recv, &
+                                    size(ghost_sched%Pg_recv_buf), ghost_sched%Pg_recv_buf, ghost_sched%pg_recv_slot, q)
+      return
+    end if
     call exchange_Pg_unpack_buf(domain % bc_pg, domain % nbound, ghost_sched%n_recv, &
                                     size(ghost_sched%Pg_recv_buf), ghost_sched%Pg_recv_buf, &
                                     ghost_sched%pg_recv_slot, q)
@@ -1737,11 +1969,20 @@ contains
     if (present(async_q)) then
       block
         use MOSE_Field_m, only: P_flat, ncell_total, dboff, dpi, dpj
+        if (xch_level >= 0) then   ! mr-xch: the sub-list of the level
+          if (xl(xch_level)%nr > 0) &
+            call fill_bc_pg_normal_lst(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), &
+                                       domain % bc_pg, domain % nbound, xl(xch_level)%nr, xl(xch_level)%ridx, ghost_sched%n_recv, &
+                                       ghost_sched%recv_b, ghost_sched%recv_id, ghost_sched%recv_jd, &
+                                       ghost_sched%recv_kd, ghost_sched%recv_di, ghost_sched%recv_dj, &
+                                       ghost_sched%recv_dk, ghost_sched%pg_recv_slot, async_q)
+        else
         call fill_bc_pg_normal_all(P_flat, ncell_total, dboff, dpi, dpj, size(dboff), &
                                      domain % bc_pg, domain % nbound, ghost_sched%n_recv, &
                                      ghost_sched%recv_b, ghost_sched%recv_id, ghost_sched%recv_jd, &
                                      ghost_sched%recv_kd, ghost_sched%recv_di, ghost_sched%recv_dj, &
                                      ghost_sched%recv_dk, ghost_sched%pg_recv_slot, async_q)
+        end if
       end block
       return
     end if
@@ -1939,6 +2180,670 @@ contains
   end subroutine exchange_Pg_recv_buf_to_device
 
 
+  !----------------------------------------------------------------------------
+  ! mr-xch: the level-restricted exchange (sub-lists, their MPI, the list kernels)
+  !----------------------------------------------------------------------------
+
+  subroutine xch_free_levels ()
+    implicit none
+    integer :: l
+    xch_nlev = 0
+    if ( .not. allocated(xl) ) return
+    do l = lbound(xl,1), ubound(xl,1)
+      if ( allocated(xl(l)%sidx) ) then
+        !$acc exit data delete(xl(l)%sidx, xl(l)%ridx)
+        deallocate ( xl(l)%sidx, xl(l)%ridx )
+      end if
+      if ( allocated(xl(l)%sidxg) ) then
+        !$acc exit data delete(xl(l)%sidxg, xl(l)%ridxg, xl(l)%gidx)
+        deallocate ( xl(l)%sidxg, xl(l)%ridxg, xl(l)%gidx )
+      end if
+      if ( allocated(xl(l)%scnt) ) deallocate ( xl(l)%scnt, xl(l)%soff, xl(l)%rcnt, xl(l)%roff )
+      if ( allocated(xl(l)%scntg) ) deallocate ( xl(l)%scntg, xl(l)%soffg, xl(l)%rcntg, xl(l)%roffg )
+      if ( allocated(xl(l)%sreq) ) deallocate ( xl(l)%sreq, xl(l)%rreq, xl(l)%sreqg, xl(l)%rreqg )
+    end do
+    deallocate ( xl )
+  end subroutine xch_free_levels
+
+  !> The receiver's masks to the donors (the pairing of mr_seam_ranks reversed: the receive groups send, the send groups
+  !> receive), then the compact sub-lists of every level on both sides, in the entry order of the schedule.
+  subroutine xch_build_levels ( domain, rmask, cmask, nlev )
+    use mpi
+    use MOSE_Types_m
+    use MOSE_Global_m, only: gc
+    use MOSE_Field_m, only: field_block_index_params
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    integer, intent(in) :: rmask(:), cmask(:), nlev
+    integer, allocatable :: smask(:), rm(:), smg(:), rmg(:), rmr(:)   ! rm = P needed (augmented), rmr = record active (box rule)
+    integer :: ns, nr, nsr, nrr, l, e, t, c, k, env_len, env_stat, p, b, eT, boff, pi, pj
+    integer :: ci(4), cj(4), ck(4), n(3)
+    logical :: ship
+    character(len=8) :: env_val
+    call xch_free_levels ()
+    if ( .not. ghost_sched%built ) return
+    if ( mpi_size_ <= 1 ) return
+    if ( nlev <= 0 ) return
+    if ( xch_env < 0 ) then
+      xch_env = 1
+      call get_environment_variable ( 'MOSE_MR_XCH', env_val, env_len, env_stat )
+      if ( env_stat == 0 .and. env_len > 0 ) then
+        if ( env_val(1:1) == '0' ) xch_env = 0
+      end if
+      if ( mpi_is_root .and. xch_env == 0 ) write(*,'(A)') &
+        ' [XCH] MOSE_MR_XCH=0: the multirate stages keep the full halo exchange'
+    end if
+    if ( xch_env == 0 ) return
+    if ( .not. ( ghost_sched%dev_bound .and. ghost_sched%bufs_resident .and. ghost_sched%pg_bufs_resident .and. &
+                 ghost_sched%dev_tables_built .and. ghost_sched%pg_tables_built ) ) then
+      if ( mpi_is_root ) write(*,'(A)') ' [XCH] the level-restricted exchange needs the device-bound halo path: off'
+      return
+    end if
+    if ( .not. allocated(xch_own) ) then   ! round 2 impossible (flat field not yet allocated): the full exchange, exact
+      if ( mpi_is_root ) write(*,'(A)') ' [XCH] ghost-owner table not ready: full halo exchange until the next full partition'
+      return
+    end if
+    ns = ghost_sched%n_send; nr = ghost_sched%n_recv
+    nsr = ghost_sched%n_send_ranks; nrr = ghost_sched%n_recv_ranks
+    allocate ( smask(max(ns,1)), rm(max(nr,1)), smg(max(ns,1)), rmg(max(nr,1)), rmr(max(nr,1)) )
+    smask = 0; rm = 0; smg = 0; rmg = 0
+    if ( nr > 0 ) rm(1:nr) = rmask(1:nr)
+    rmr = rm   ! the Pg decisions (ship / gather) follow the record's own levels; the augmented levels are P-only
+    ! pg-edge on the level: an entry the level reads is gathered only if its four neighbours are read by the level too
+    ! (their ghosts fresh at this stage); else its Pg is shipped
+    rmg = 0
+    if ( pgx%on ) then
+      do e = 1, nr
+        do l = 0, nlev - 1
+          if ( .not. btest(rmr(e), l) ) cycle
+          ship = .false.
+          do k = 1, 4
+            if ( pgx%nbr(k,e) <= 0 ) then
+              ship = .true.
+            else if ( .not. btest(rm(pgx%nbr(k,e)), l) ) then
+              ship = .true.
+            end if
+          end do
+          if ( ship ) rmg(e) = ibset( rmg(e), l )
+        end do
+      end do
+    else
+      rmg = rmr
+    end if
+    call xch_ship_mask ( rm, smask )
+    call xch_ship_mask ( rmg, smg )
+    ! round 2 (exactness at the face edges): the transverse gathers of a stage read donor ghosts at the face edges, some of
+    ! which another rank fills (xch_own); those entries must be in the level's sub-list too -- for the shipped Pg packs
+    ! of this rank's send entries (smg) and for the same-rank pass-2 records (cmask). Then the masks travel again.
+    if ( .true. ) then
+      do e = 1, ns
+        if ( smg(e) == 0 ) cycle
+        b = ghost_sched%send_b(e); n = domain%blk(b)%dim
+        call xch_transverse_cells ( ghost_sched%send_is(e), ghost_sched%send_js(e), ghost_sched%send_ks(e), &
+                                    ghost_sched%pg_send_fs(e), ghost_sched%pg_send_d11(e), ghost_sched%pg_send_d12(e), &
+                                    ghost_sched%pg_send_d21(e), ghost_sched%pg_send_d22(e), ci, cj, ck )
+        call field_block_index_params ( b, boff, pi, pj )
+        do k = 1, 4
+          if ( ci(k) >= 1 .and. ci(k) <= n(1) .and. cj(k) >= 1 .and. cj(k) <= n(2) .and. ck(k) >= 1 .and. ck(k) <= n(3) ) cycle
+          eT = xch_own( boff + (ci(k)+gc-1) + (cj(k)+gc-1)*pi + (ck(k)+gc-1)*pi*pj + 1 )
+          if ( eT > 0 ) rm(eT) = ior( rm(eT), smg(e) )
+        end do
+      end do
+      do p = 1, domain % n_conn_pair
+        b = domain % conn_pair_bs(p); n = domain%blk(b)%dim
+        call field_block_index_params ( b, boff, pi, pj )
+        do c = domain % conn_pair_lo(p), domain % conn_pair_hi(p)
+          if ( cmask(c) == 0 ) cycle
+          call xch_transverse_cells ( domain%conn_is(c), domain%conn_js(c), domain%conn_ks(c), domain%conn_fs(c), &
+                                      domain%conn_d11(c), domain%conn_d12(c), domain%conn_d21(c), domain%conn_d22(c), &
+                                      ci, cj, ck )
+          do k = 1, 4
+            if ( ci(k) >= 1 .and. ci(k) <= n(1) .and. cj(k) >= 1 .and. cj(k) <= n(2) .and. ck(k) >= 1 .and. ck(k) <= n(3) ) cycle
+            eT = xch_own( boff + (ci(k)+gc-1) + (cj(k)+gc-1)*pi + (ck(k)+gc-1)*pi*pj + 1 )
+            if ( eT > 0 ) rm(eT) = ior( rm(eT), cmask(c) )
+          end do
+        end do
+      end do
+      ! the shipped Pg with the augmented P masks (fewer ships, never more donor-ghost reads), then both travel again
+      rmg = 0
+      if ( pgx%on ) then
+        do e = 1, nr
+          do l = 0, nlev - 1
+            if ( .not. btest(rmr(e), l) ) cycle
+            ship = .false.
+            do k = 1, 4
+              if ( pgx%nbr(k,e) <= 0 ) then
+                ship = .true.
+              else if ( .not. btest(rm(pgx%nbr(k,e)), l) ) then
+                ship = .true.
+              end if
+            end do
+            if ( ship ) rmg(e) = ibset( rmg(e), l )
+          end do
+        end do
+      else
+        rmg = rmr
+      end if
+      call xch_ship_mask ( rm, smask )
+      call xch_ship_mask ( rmg, smg )
+    end if
+    allocate ( xl(0:nlev-1) )
+    do l = 0, nlev - 1
+      allocate ( xl(l)%scnt(max(nsr,1)), xl(l)%soff(max(nsr,1)), xl(l)%rcnt(max(nrr,1)), xl(l)%roff(max(nrr,1)) )
+      allocate ( xl(l)%scntg(max(nsr,1)), xl(l)%soffg(max(nsr,1)), xl(l)%rcntg(max(nrr,1)), xl(l)%roffg(max(nrr,1)) )
+      allocate ( xl(l)%sreq(max(nsr,1)), xl(l)%rreq(max(nrr,1)), xl(l)%sreqg(max(nsr,1)), xl(l)%rreqg(max(nrr,1)) )
+      xl(l)%sreq = MPI_REQUEST_NULL; xl(l)%rreq = MPI_REQUEST_NULL
+      xl(l)%sreqg = MPI_REQUEST_NULL; xl(l)%rreqg = MPI_REQUEST_NULL
+      call xch_compact ( smask, ns, l, ghost_sched%send_groups, nsr, xl(l)%sidx, xl(l)%ns, xl(l)%scnt, xl(l)%soff )
+      call xch_compact ( rm,    nr, l, ghost_sched%recv_groups, nrr, xl(l)%ridx, xl(l)%nr, xl(l)%rcnt, xl(l)%roff )
+      call xch_compact ( smg,   ns, l, ghost_sched%send_groups, nsr, xl(l)%sidxg, xl(l)%nsg, xl(l)%scntg, xl(l)%soffg )
+      call xch_compact ( rmg,   nr, l, ghost_sched%recv_groups, nrr, xl(l)%ridxg, xl(l)%nrg, xl(l)%rcntg, xl(l)%roffg )
+      ! the gathered entries of the level: read by the level, Pg not shipped
+      c = 0
+      do e = 1, nr
+        if ( btest(rmr(e), l) .and. .not. btest(rmg(e), l) ) c = c + 1
+      end do
+      xl(l)%ng = c
+      allocate ( xl(l)%gidx(max(c,1)) ); xl(l)%gidx = 1
+      t = 0
+      do e = 1, nr
+        if ( btest(rmr(e), l) .and. .not. btest(rmg(e), l) ) then
+          t = t + 1; xl(l)%gidx(t) = e
+        end if
+      end do
+      !$acc enter data copyin(xl(l)%sidx, xl(l)%ridx, xl(l)%sidxg, xl(l)%ridxg, xl(l)%gidx)
+    end do
+    xch_nlev = nlev
+    deallocate ( smask, rm, smg, rmg, rmr )
+  end subroutine xch_build_levels
+
+  !> The receiver's per-entry integers to the donors (the pairing of mr_seam_ranks reversed: the receive groups send, the
+  !> send groups receive), in the entry order of the schedule.
+  subroutine xch_ship_mask ( rm, sm )
+    use mpi
+    implicit none
+    integer, intent(in),  contiguous :: rm(:)   ! contiguous: the element arguments of the MPI calls take no copy
+    integer, intent(out), contiguous :: sm(:)
+    integer, allocatable :: sreq(:), rreq(:)
+    integer :: nsr, nrr, r, ierr, tag
+    nsr = ghost_sched%n_send_ranks; nrr = ghost_sched%n_recv_ranks
+    allocate ( sreq(max(nsr,1)), rreq(max(nrr,1)) )
+    sm = 0
+    do r = 1, nsr
+      tag = ghost_sched%send_groups(r)%rank + 42000
+      call MPI_IRECV ( sm(ghost_sched%send_groups(r)%offset), ghost_sched%send_groups(r)%count, MPI_INTEGER, &
+                       ghost_sched%send_groups(r)%rank, tag, MPI_COMM_WORLD, sreq(r), ierr )
+      call check_mpi_error(ierr)
+    end do
+    do r = 1, nrr
+      tag = mpi_rank_ + 42000
+      call MPI_ISEND ( rm(ghost_sched%recv_groups(r)%offset), ghost_sched%recv_groups(r)%count, MPI_INTEGER, &
+                       ghost_sched%recv_groups(r)%rank, tag, MPI_COMM_WORLD, rreq(r), ierr )
+      call check_mpi_error(ierr)
+    end do
+    if ( nsr > 0 ) call MPI_WAITALL ( nsr, sreq, MPI_STATUSES_IGNORE, ierr )
+    if ( nrr > 0 ) call MPI_WAITALL ( nrr, rreq, MPI_STATUSES_IGNORE, ierr )
+    deallocate ( sreq, rreq )
+  end subroutine xch_ship_mask
+
+  !> The four tangential neighbours of a donor face cell, in the order of exchange_Pg_pack_all (bc_pg columns 3..6).
+  subroutine xch_transverse_cells ( Is, Js, Ks, Fs, d11, d12, d21, d22, ci, cj, ck )
+    implicit none
+    integer, intent(in)  :: Is, Js, Ks, Fs, d11, d12, d21, d22
+    integer, intent(out) :: ci(4), cj(4), ck(4)
+    select case (Fs)
+      case (1:2)
+        ci = (/ Is, Is, Is, Is /); cj = (/ Js-d11, Js+d11, Js-d21, Js+d21 /); ck = (/ Ks-d12, Ks+d12, Ks-d22, Ks+d22 /)
+      case (3:4)
+        ci = (/ Is-d11, Is+d11, Is-d21, Is+d21 /); cj = (/ Js, Js, Js, Js /); ck = (/ Ks-d12, Ks+d12, Ks-d22, Ks+d22 /)
+      case default
+        ci = (/ Is-d11, Is+d11, Is-d21, Is+d21 /); cj = (/ Js-d12, Js+d12, Js-d22, Js+d22 /); ck = (/ Ks, Ks, Ks, Ks /)
+    end select
+  end subroutine xch_transverse_cells
+
+  !> xch_own: the flat index of the two ghost cells of every receive entry -> the entry (the lookups of round 2).
+  subroutine xch_build_own ( )
+    use MOSE_Global_m, only: gc
+    use MOSE_Field_m, only: ncell_total, field_block_index_params
+    implicit none
+    integer :: e, g, b, boff, pi, pj, i, j, k
+    if ( allocated(xch_own) ) deallocate ( xch_own )
+    allocate ( xch_own(ncell_total) ); xch_own = 0
+    do e = 1, ghost_sched%n_recv
+      b = ghost_sched%recv_b(e)
+      call field_block_index_params ( b, boff, pi, pj )
+      do g = 1, gc
+        i = ghost_sched%recv_id(e) - g * ghost_sched%recv_di(e)
+        j = ghost_sched%recv_jd(e) - g * ghost_sched%recv_dj(e)
+        k = ghost_sched%recv_kd(e) - g * ghost_sched%recv_dk(e)
+        xch_own( boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1 ) = e
+      end do
+    end do
+  end subroutine xch_build_own
+
+  !> The compact list of the entries with bit l of mask(1:n), with the per-group counts and first compact positions
+  !> (the groups are consecutive ranges of the rank-sorted list).
+  subroutine xch_compact ( mask, n, l, groups, ngr, idx, nl, cnt, off )
+    implicit none
+    integer, intent(in) :: mask(:), n, l, ngr
+    type(rank_group_type), intent(in) :: groups(:)
+    integer, allocatable, intent(inout) :: idx(:)
+    integer, intent(out) :: nl, cnt(:), off(:)
+    integer :: r, e, c, t
+    cnt = 0; off = 1
+    c = 0
+    do r = 1, ngr
+      off(r) = c + 1
+      do e = groups(r)%offset, groups(r)%offset + groups(r)%count - 1
+        if ( btest(mask(e), l) ) c = c + 1
+      end do
+      cnt(r) = c + 1 - off(r)
+    end do
+    nl = c
+    if ( allocated(idx) ) deallocate ( idx )
+    allocate ( idx(max(c,1)) ); idx = 1
+    t = 0
+    do e = 1, n
+      if ( btest(mask(e), l) ) then
+        t = t + 1; idx(t) = e
+      end if
+    end do
+  end subroutine xch_compact
+
+  ! --- the MPI of the sub-list of level l: P (tags 10000 + rank) and Pg (12000 + rank), on the resident buffers ---
+  subroutine xch_P_post_recv ( l )
+    use MOSE_Global_m, only: gc, nprim
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: r, ierr, pos, es
+    es = nprim * gc
+    do r = 1, ghost_sched%n_recv_ranks
+      xl(l)%rreq(r) = MPI_REQUEST_NULL
+      if ( xl(l)%rcnt(r) == 0 ) cycle
+      pos = ( xl(l)%roff(r) - 1 ) * es + 1
+      !$acc host_data use_device(ghost_sched%P_recv_buf)
+      call MPI_IRECV ( ghost_sched%P_recv_buf(pos), xl(l)%rcnt(r) * es, MPI_DOUBLE_PRECISION, &
+                       ghost_sched%recv_groups(r)%rank, ghost_sched%recv_groups(r)%rank + 10000, MPI_COMM_WORLD, &
+                       xl(l)%rreq(r), ierr )
+      !$acc end host_data
+      call check_mpi_error(ierr)
+    end do
+  end subroutine xch_P_post_recv
+
+  subroutine xch_P_post_send ( l )
+    use MOSE_Global_m, only: gc, nprim
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: r, ierr, pos, es
+    es = nprim * gc
+    do r = 1, ghost_sched%n_send_ranks
+      xl(l)%sreq(r) = MPI_REQUEST_NULL
+      if ( xl(l)%scnt(r) == 0 ) cycle
+      pos = ( xl(l)%soff(r) - 1 ) * es + 1
+      !$acc host_data use_device(ghost_sched%P_send_buf)
+      call MPI_ISEND ( ghost_sched%P_send_buf(pos), xl(l)%scnt(r) * es, MPI_DOUBLE_PRECISION, &
+                       ghost_sched%send_groups(r)%rank, mpi_rank_ + 10000, MPI_COMM_WORLD, xl(l)%sreq(r), ierr )
+      !$acc end host_data
+      call check_mpi_error(ierr)
+    end do
+  end subroutine xch_P_post_send
+
+  subroutine xch_P_wait_recv ( l )
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: ierr
+    if ( ghost_sched%n_recv_ranks > 0 ) then
+      call MPI_WAITALL ( ghost_sched%n_recv_ranks, xl(l)%rreq, ghost_sched%mpi_stat(:,1:ghost_sched%n_recv_ranks), ierr )
+      call check_mpi_error(ierr)
+    end if
+  end subroutine xch_P_wait_recv
+
+  subroutine xch_P_wait_send ( l )
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: ierr
+    if ( ghost_sched%n_send_ranks > 0 ) then
+      call MPI_WAITALL ( ghost_sched%n_send_ranks, xl(l)%sreq, ghost_sched%mpi_stat(:,1:ghost_sched%n_send_ranks), ierr )
+      call check_mpi_error(ierr)
+    end if
+  end subroutine xch_P_wait_send
+
+  subroutine xch_Pg_post_recv ( l )
+    use MOSE_Global_m, only: nprim
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: r, ierr, pos, es
+    es = nprim * 4
+    do r = 1, ghost_sched%n_recv_ranks
+      xl(l)%rreqg(r) = MPI_REQUEST_NULL
+      if ( xl(l)%rcntg(r) == 0 ) cycle
+      pos = ( xl(l)%roffg(r) - 1 ) * es + 1
+      !$acc host_data use_device(ghost_sched%Pg_recv_buf)
+      call MPI_IRECV ( ghost_sched%Pg_recv_buf(pos), xl(l)%rcntg(r) * es, MPI_DOUBLE_PRECISION, &
+                       ghost_sched%recv_groups(r)%rank, ghost_sched%recv_groups(r)%rank + 12000, MPI_COMM_WORLD, &
+                       xl(l)%rreqg(r), ierr )
+      !$acc end host_data
+      call check_mpi_error(ierr)
+    end do
+  end subroutine xch_Pg_post_recv
+
+  subroutine xch_Pg_post_send ( l )
+    use MOSE_Global_m, only: nprim
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: r, ierr, pos, es
+    es = nprim * 4
+    do r = 1, ghost_sched%n_send_ranks
+      xl(l)%sreqg(r) = MPI_REQUEST_NULL
+      if ( xl(l)%scntg(r) == 0 ) cycle
+      pos = ( xl(l)%soffg(r) - 1 ) * es + 1
+      !$acc host_data use_device(ghost_sched%Pg_send_buf)
+      call MPI_ISEND ( ghost_sched%Pg_send_buf(pos), xl(l)%scntg(r) * es, MPI_DOUBLE_PRECISION, &
+                       ghost_sched%send_groups(r)%rank, mpi_rank_ + 12000, MPI_COMM_WORLD, xl(l)%sreqg(r), ierr )
+      !$acc end host_data
+      call check_mpi_error(ierr)
+    end do
+  end subroutine xch_Pg_post_send
+
+  subroutine xch_Pg_wait_recv ( l )
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: ierr
+    if ( ghost_sched%n_recv_ranks > 0 ) then
+      call MPI_WAITALL ( ghost_sched%n_recv_ranks, xl(l)%rreqg, ghost_sched%mpi_stat(:,1:ghost_sched%n_recv_ranks), ierr )
+      call check_mpi_error(ierr)
+    end if
+  end subroutine xch_Pg_wait_recv
+
+  subroutine xch_Pg_wait_send ( l )
+    use mpi
+    implicit none
+    integer, intent(in) :: l
+    integer :: ierr
+    if ( ghost_sched%n_send_ranks > 0 ) then
+      call MPI_WAITALL ( ghost_sched%n_send_ranks, xl(l)%sreqg, ghost_sched%mpi_stat(:,1:ghost_sched%n_send_ranks), ierr )
+      call check_mpi_error(ierr)
+    end if
+  end subroutine xch_Pg_wait_send
+
+  ! --- the list variants of the *_all kernels: schedule entry i = idx(t), buffer position t ---
+  subroutine exchange_P_pack_lst(w, ncw, dboff, dpi, dpj, nb, nl, idx, ns, nbuf, sbuf, sb, sis, sjs, sks, sdi, sdj, sdk, q)
+    use MOSE_Global_m, only: gc, nprim
+    implicit none
+    integer,  intent(in)    :: ncw, nb, nl, ns, nbuf, q
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: sbuf(nbuf)
+    integer,  intent(in)    :: dboff(nb), dpi(nb), dpj(nb), idx(nl)
+    integer,  intent(in)    :: sb(ns), sis(ns), sjs(ns), sks(ns), sdi(ns), sdj(ns), sdk(ns)
+    integer :: t, i, g, s, Is, Js, Ks, di, dj, dk, base, ii, jj, kk, bq, boff, pi, pj
+    !$acc parallel loop gang vector async(q) present(w, sbuf, idx, sb, sis, sjs, sks, sdi, sdj, sdk, dboff, dpi, dpj) &
+    !$acc&   private(i, g, s, Is, Js, Ks, di, dj, dk, base, ii, jj, kk, bq, boff, pi, pj)
+    do t = 1, nl
+      i = idx(t)
+      bq = sb(i); boff = dboff(bq); pi = dpi(bq); pj = dpj(bq)
+      Is = sis(i); Js = sjs(i); Ks = sks(i)
+      di = sdi(i); dj = sdj(i); dk = sdk(i)
+      base = (t - 1) * nprim * gc
+      do g = 1, gc
+        ii = Is + di*(g-1); jj = Js + dj*(g-1); kk = Ks + dk*(g-1)
+        do s = 1, nprim
+          sbuf(base + (g-1)*nprim + s) = WGCELL(s, ii, jj, kk)
+        end do
+      end do
+    end do
+  end subroutine exchange_P_pack_lst
+
+  subroutine exchange_P_unpack_lst(w, ncw, dboff, dpi, dpj, nb, nl, idx, nr, nbuf, rbuf, rb, rid, rjd, rkd, rdi, rdj, rdk, q)
+    use MOSE_Global_m, only: gc, nprim
+    implicit none
+    integer,  intent(in)    :: ncw, nb, nl, nr, nbuf, q
+    real(R8), intent(inout) :: w(ncw, nprim)
+    real(R8), intent(in)    :: rbuf(nbuf)
+    integer,  intent(in)    :: dboff(nb), dpi(nb), dpj(nb), idx(nl)
+    integer,  intent(in)    :: rb(nr), rid(nr), rjd(nr), rkd(nr), rdi(nr), rdj(nr), rdk(nr)
+    integer :: t, i, g, s, Id, Jd, Kd, di, dj, dk, base, ii, jj, kk, bq, boff, pi, pj
+    !$acc parallel loop gang vector async(q) present(w, rbuf, idx, rb, rid, rjd, rkd, rdi, rdj, rdk, dboff, dpi, dpj) &
+    !$acc&   private(i, g, s, Id, Jd, Kd, di, dj, dk, base, ii, jj, kk, bq, boff, pi, pj)
+    do t = 1, nl
+      i = idx(t)
+      bq = rb(i); boff = dboff(bq); pi = dpi(bq); pj = dpj(bq)
+      Id = rid(i); Jd = rjd(i); Kd = rkd(i)
+      di = rdi(i); dj = rdj(i); dk = rdk(i)
+      base = (t - 1) * nprim * gc
+      do g = 1, gc
+        ii = Id - di*g; jj = Jd - dj*g; kk = Kd - dk*g
+        do s = 1, nprim
+          WGCELL(s, ii, jj, kk) = rbuf(base + (g-1)*nprim + s)
+        end do
+      end do
+    end do
+  end subroutine exchange_P_unpack_lst
+
+  subroutine exchange_Pg_pack_lst(w, ncw, dboff, dpi, dpj, nb, nl, idx, ns, nbuf, sbuf, sb, sis, sjs, sks, sfs, &
+                                  sd11, sd12, sd21, sd22, q)
+    use MOSE_Global_m, only: gc, nprim
+    implicit none
+    integer,  intent(in)    :: ncw, nb, nl, ns, nbuf, q
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: sbuf(nbuf)
+    integer,  intent(in)    :: dboff(nb), dpi(nb), dpj(nb), idx(nl)
+    integer,  intent(in)    :: sb(ns), sis(ns), sjs(ns), sks(ns), sfs(ns)
+    integer,  intent(in)    :: sd11(ns), sd12(ns), sd21(ns), sd22(ns)
+    integer :: t, i, s, Is, Js, Ks, Fs, d11, d12, d21, d22, base, bq, boff, pi, pj
+    integer :: i1, j1, k1, i2, j2, k2, i3, j3, k3, i4, j4, k4
+    !$acc parallel loop gang vector async(q) present(w, sbuf, idx, sb, sis, sjs, sks, sfs, sd11, sd12, sd21, sd22, dboff, dpi, dpj) &
+    !$acc&   private(i, s, Is, Js, Ks, Fs, d11, d12, d21, d22, base, bq, boff, pi, pj, &
+    !$acc&           i1, j1, k1, i2, j2, k2, i3, j3, k3, i4, j4, k4)
+    do t = 1, nl
+      i = idx(t)
+      bq = sb(i); boff = dboff(bq); pi = dpi(bq); pj = dpj(bq)
+      Is = sis(i); Js = sjs(i); Ks = sks(i); Fs = sfs(i)
+      d11 = sd11(i); d12 = sd12(i); d21 = sd21(i); d22 = sd22(i)
+      select case (Fs)
+        case (1:2)
+          i1=Is; j1=Js-d11; k1=Ks-d12;  i2=Is; j2=Js+d11; k2=Ks+d12
+          i3=Is; j3=Js-d21; k3=Ks-d22;  i4=Is; j4=Js+d21; k4=Ks+d22
+        case (3:4)
+          i1=Is-d11; j1=Js; k1=Ks-d12;  i2=Is+d11; j2=Js; k2=Ks+d12
+          i3=Is-d21; j3=Js; k3=Ks-d22;  i4=Is+d21; j4=Js; k4=Ks+d22
+        case default  ! (5:6)
+          i1=Is-d11; j1=Js-d12; k1=Ks;  i2=Is+d11; j2=Js+d12; k2=Ks
+          i3=Is-d21; j3=Js-d22; k3=Ks;  i4=Is+d21; j4=Js+d22; k4=Ks
+      end select
+      base = (t - 1) * nprim * 4
+      do s = 1, nprim
+        sbuf(base           + s) = WGCELL(s, i1, j1, k1)
+        sbuf(base +   nprim + s) = WGCELL(s, i2, j2, k2)
+        sbuf(base + 2*nprim + s) = WGCELL(s, i3, j3, k3)
+        sbuf(base + 3*nprim + s) = WGCELL(s, i4, j4, k4)
+      end do
+    end do
+  end subroutine exchange_Pg_pack_lst
+
+  subroutine exchange_Pg_unpack_lst(bc_pg, nbnd, nl, idx, nr, nbuf, rbuf, rslot, q)
+    use MOSE_Global_m, only: nprim
+    implicit none
+    integer,  intent(in)    :: nbnd, nl, nr, nbuf, q
+    real(R8), intent(inout) :: bc_pg(nprim, 6, nbnd)
+    real(R8), intent(in)    :: rbuf(nbuf)
+    integer,  intent(in)    :: idx(nl), rslot(nr)
+    integer :: t, i, s, slot, base
+    !$acc parallel loop gang vector async(q) present(bc_pg, rbuf, idx, rslot) private(i, s, slot, base)
+    do t = 1, nl
+      i = idx(t)
+      slot = rslot(i)
+      base = (t - 1) * nprim * 4
+      do s = 1, nprim
+        bc_pg(s, 3, slot) = rbuf(base           + s)
+        bc_pg(s, 4, slot) = rbuf(base +   nprim + s)
+        bc_pg(s, 5, slot) = rbuf(base + 2*nprim + s)
+        bc_pg(s, 6, slot) = rbuf(base + 3*nprim + s)
+      end do
+    end do
+  end subroutine exchange_Pg_unpack_lst
+
+  subroutine fill_bc_pg_normal_lst(w, ncw, dboff, dpi, dpj, nb, bc_pg, nbnd, nl, idx, nr, rb, rid, rjd, rkd, rdi, rdj, rdk, &
+                                   rslot, q)
+    use MOSE_Global_m, only: gc, nprim
+    implicit none
+    integer,  intent(in)    :: ncw, nb, nbnd, nl, nr, q
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: bc_pg(nprim, 6, nbnd)
+    integer,  intent(in)    :: dboff(nb), dpi(nb), dpj(nb), idx(nl)
+    integer,  intent(in)    :: rb(nr), rid(nr), rjd(nr), rkd(nr), rdi(nr), rdj(nr), rdk(nr), rslot(nr)
+    integer :: t, i, g, s, Id, Jd, Kd, di, dj, dk, slot, ii, jj, kk, bq, boff, pi, pj
+    !$acc parallel loop gang vector async(q) present(w, bc_pg, idx, rb, rid, rjd, rkd, rdi, rdj, rdk, rslot, dboff, dpi, dpj) &
+    !$acc&   private(i, g, s, Id, Jd, Kd, di, dj, dk, slot, ii, jj, kk, bq, boff, pi, pj)
+    do t = 1, nl
+      i = idx(t)
+      bq = rb(i); boff = dboff(bq); pi = dpi(bq); pj = dpj(bq)
+      Id = rid(i); Jd = rjd(i); Kd = rkd(i)
+      di = rdi(i); dj = rdj(i); dk = rdk(i)
+      slot = rslot(i)
+      do g = 1, gc
+        ii = Id - di*g; jj = Jd - dj*g; kk = Kd - dk*g
+        do s = 1, nprim
+          bc_pg(s, g, slot) = WGCELL(s, ii, jj, kk)
+        end do
+      end do
+    end do
+  end subroutine fill_bc_pg_normal_lst
+
+  !> pg-edge: bc_pg(:,3:6,slot(e)) of the gathered entries e = gidx(t) from the receiver's own ghost P at gcell(1:4,e).
+  subroutine fill_bc_pg_transverse_lst(w, ncw, bc_pg, nbnd, nl, gidx, nr, gcell, rslot, q)
+    use MOSE_Global_m, only: nprim
+    implicit none
+    integer,  intent(in)    :: ncw, nbnd, nl, nr, q
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: bc_pg(nprim, 6, nbnd)
+    integer,  intent(in)    :: gidx(nl), gcell(4, nr), rslot(nr)
+    integer :: t, i, s, slot, c1, c2, c3, c4
+    !$acc parallel loop gang vector async(q) present(w, bc_pg, gidx, gcell, rslot) private(i, s, slot, c1, c2, c3, c4)
+    do t = 1, nl
+      i = gidx(t)
+      slot = rslot(i)
+      c1 = gcell(1,i); c2 = gcell(2,i); c3 = gcell(3,i); c4 = gcell(4,i)
+      do s = 1, nprim
+        bc_pg(s, 3, slot) = w(c1, s)
+        bc_pg(s, 4, slot) = w(c2, s)
+        bc_pg(s, 5, slot) = w(c3, s)
+        bc_pg(s, 6, slot) = w(c4, s)
+      end do
+    end do
+  end subroutine fill_bc_pg_transverse_lst
+
+  !> pg-edge tables (once, from finalize_pg_tables): for every receive entry the four tangential neighbours of its donor
+  !> cell (the record's transverse pairs, as exchange_Pg_pack_all) looked up among the donor cells this rank receives
+  !> (any local block); found -> the flat index of that entry's first ghost cell; else the entry is shipped. The shipped
+  !> set travels to the donors as a mask; the compact lists on both sides keep the schedule order.
+  subroutine pgx_build ( domain )
+    use MOSE_Types_m
+    use MOSE_Global_m, only: gc, guide
+    use MOSE_Field_m, only: field_block_index_params
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    integer, allocatable :: tab(:,:,:), rmg(:), smg(:), cnt1(:), cnt2(:), cnt3(:), bl(:)
+    integer :: ns, nr, nsr, nrr, e, k, bs, bidx, Is, Js, Ks, Fs, d11, d12, d21, d22, n1, n2, n3, boff, pi, pj
+    integer :: ni(4), nj(4), nk(4), ep, b, env_len, env_stat, c, t
+    character(len=8) :: env_val
+    pgx%on = .false.
+    if ( .not. ghost_sched%built ) return
+    if ( mpi_size_ <= 1 ) return
+    call get_environment_variable ( 'MOSE_PG_EDGE', env_val, env_len, env_stat )
+    if ( env_stat == 0 .and. env_len > 0 ) then
+      if ( env_val(1:1) == '0' ) then
+        if ( mpi_is_root ) write(*,'(A)') ' [halo] MOSE_PG_EDGE=0: the transverse Pg is shipped for every entry'
+        return
+      end if
+    end if
+    if ( .not. ( ghost_sched%dev_bound .and. ghost_sched%pg_bufs_resident .and. ghost_sched%dev_tables_built ) ) then
+      if ( mpi_is_root ) write(*,'(A)') ' [halo] pg-edge needs the device-bound halo path: the full Pg exchange stays'
+      return
+    end if
+    ns = ghost_sched%n_send; nr = ghost_sched%n_recv
+    nsr = ghost_sched%n_send_ranks; nrr = ghost_sched%n_recv_ranks
+    allocate ( pgx%nbr(4, max(nr,1)), pgx%gcell(4, max(nr,1)), rmg(max(nr,1)), smg(max(ns,1)) )
+    pgx%nbr = 0; pgx%gcell = 0; rmg = 0; smg = 0
+    ! the donor cells this rank receives, per remote block: tab(is,js,ks) = entry
+    allocate ( bl(domain%nb), cnt1(domain%nb), cnt2(domain%nb), cnt3(domain%nb) )
+    bl = 0; cnt1 = 0; cnt2 = 0; cnt3 = 0
+    do e = 1, nr
+      bs = ghost_sched%recv_list(e)%remote_block
+      bl(bs) = 1
+      cnt1(bs) = max( cnt1(bs), ghost_sched%recv_list(e)%src_i )
+      cnt2(bs) = max( cnt2(bs), ghost_sched%recv_list(e)%src_j )
+      cnt3(bs) = max( cnt3(bs), ghost_sched%recv_list(e)%src_k )
+    end do
+    do b = 1, domain%nb
+      if ( bl(b) == 0 ) cycle
+      n1 = cnt1(b); n2 = cnt2(b); n3 = cnt3(b)
+      allocate ( tab(n1, n2, n3) ); tab = 0
+      do e = 1, nr
+        if ( ghost_sched%recv_list(e)%remote_block /= b ) cycle
+        tab( ghost_sched%recv_list(e)%src_i, ghost_sched%recv_list(e)%src_j, ghost_sched%recv_list(e)%src_k ) = e
+      end do
+      do e = 1, nr
+        if ( ghost_sched%recv_list(e)%remote_block /= b ) cycle
+        bidx = ghost_sched%recv_list(e)%bc_idx
+        Is = ghost_sched%recv_list(e)%src_i; Js = ghost_sched%recv_list(e)%src_j; Ks = ghost_sched%recv_list(e)%src_k
+        Fs = ghost_sched%recv_list(e)%src_f
+        d11 = domain%bc(bidx)%d11; d12 = domain%bc(bidx)%d12; d21 = domain%bc(bidx)%d21; d22 = domain%bc(bidx)%d22
+        select case (Fs)
+          case (1:2)
+            ni = (/ Is, Is, Is, Is /); nj = (/ Js-d11, Js+d11, Js-d21, Js+d21 /); nk = (/ Ks-d12, Ks+d12, Ks-d22, Ks+d22 /)
+          case (3:4)
+            ni = (/ Is-d11, Is+d11, Is-d21, Is+d21 /); nj = (/ Js, Js, Js, Js /); nk = (/ Ks-d12, Ks+d12, Ks-d22, Ks+d22 /)
+          case default
+            ni = (/ Is-d11, Is+d11, Is-d21, Is+d21 /); nj = (/ Js-d12, Js+d12, Js-d22, Js+d22 /); nk = (/ Ks, Ks, Ks, Ks /)
+        end select
+        do k = 1, 4
+          ep = 0
+          if ( ni(k) >= 1 .and. ni(k) <= n1 .and. nj(k) >= 1 .and. nj(k) <= n2 .and. nk(k) >= 1 .and. nk(k) <= n3 ) &
+            ep = tab( ni(k), nj(k), nk(k) )
+          if ( ep > 0 ) then
+            ! the first ghost cell of entry ep on its local block: dst - guide(dst_f) (exchange_P_unpack_all, g = 1)
+            call field_block_index_params ( ghost_sched%recv_list(ep)%local_block, boff, pi, pj )
+            pgx%nbr(k,e) = ep
+            pgx%gcell(k,e) = boff + ( ghost_sched%recv_list(ep)%dst_i - guide(ghost_sched%recv_list(ep)%dst_f,1) + gc - 1 ) + &
+                                    ( ghost_sched%recv_list(ep)%dst_j - guide(ghost_sched%recv_list(ep)%dst_f,2) + gc - 1 ) * pi + &
+                                    ( ghost_sched%recv_list(ep)%dst_k - guide(ghost_sched%recv_list(ep)%dst_f,3) + gc - 1 ) * pi * pj + 1
+          else
+            rmg(e) = 1
+          end if
+        end do
+      end do
+      deallocate ( tab )
+    end do
+    deallocate ( bl, cnt1, cnt2, cnt3 )
+    call xch_ship_mask ( rmg, smg )
+    ! the compact lists (bit 0 = shipped), the gathered entries
+    allocate ( pgx%scnt(max(nsr,1)), pgx%soff(max(nsr,1)), pgx%rcnt(max(nrr,1)), pgx%roff(max(nrr,1)) )
+    call xch_compact ( smg, ns, 0, ghost_sched%send_groups, nsr, pgx%sidx, pgx%ns, pgx%scnt, pgx%soff )
+    call xch_compact ( rmg, nr, 0, ghost_sched%recv_groups, nrr, pgx%ridx, pgx%nr, pgx%rcnt, pgx%roff )
+    c = count( rmg(1:nr) == 0 )
+    pgx%ng = c
+    allocate ( pgx%gidx(max(c,1)) ); pgx%gidx = 1
+    t = 0
+    do e = 1, nr
+      if ( rmg(e) == 0 ) then
+        t = t + 1; pgx%gidx(t) = e
+      end if
+    end do
+    deallocate ( rmg, smg )
+    !$acc enter data copyin(pgx%sidx, pgx%ridx, pgx%gidx, pgx%gcell)
+    pgx%on = .true.
+    write(*,'(A,I4,A,I0,A,I0,A,I0,A,I0)') ' [halo] rank ', mpi_rank_, ': Pg shipped for ', pgx%nr, ' of ', nr, &
+      ' receive entries (face edges), gathered from own ghosts ', pgx%ng, '; sent ', pgx%ns
+  end subroutine pgx_build
+
+
 
 #endif
 
@@ -1972,6 +2877,9 @@ contains
     block
       use mpi
       integer :: ierr
+      if (xch_level >= 0) then
+        call xch_Pg_post_recv(xch_level); return
+      end if
       if (.not. ghost_sched%persistent_Pg_init) return
       if (ghost_sched%n_recv_ranks > 0) then
         call MPI_STARTALL(ghost_sched%n_recv_ranks, ghost_sched%Pg_recv_req_pers, ierr)
@@ -2014,6 +2922,9 @@ contains
     block
       use mpi
       integer :: ierr
+      if (xch_level >= 0) then
+        call xch_Pg_post_send(xch_level); return
+      end if
       if (.not. ghost_sched%persistent_Pg_init) return
       if (ghost_sched%n_send_ranks > 0) then
         call MPI_STARTALL(ghost_sched%n_send_ranks, ghost_sched%Pg_send_req_pers, ierr)
@@ -2033,6 +2944,9 @@ contains
     block
       use mpi
       integer :: ierr
+      if (xch_level >= 0) then
+        call xch_Pg_wait_recv(xch_level); return
+      end if
       if (.not. ghost_sched%persistent_Pg_init) return
       if (ghost_sched%n_recv_ranks > 0) then
         call MPI_WAITALL(ghost_sched%n_recv_ranks, ghost_sched%Pg_recv_req_pers, &
@@ -2083,6 +2997,9 @@ contains
     block
       use mpi
       integer :: ierr
+      if (xch_level >= 0) then
+        call xch_Pg_wait_send(xch_level); return
+      end if
       if (.not. ghost_sched%persistent_Pg_init) return
       if (ghost_sched%n_send_ranks > 0) then
         call MPI_WAITALL(ghost_sched%n_send_ranks, ghost_sched%Pg_send_req_pers, &

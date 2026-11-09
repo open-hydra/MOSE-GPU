@@ -27,8 +27,9 @@ module MOSE_Mod_Diffusive
   use MOSE_Field_m,    only: P_flat, field_block_index_params
   implicit none
   private
-  public :: Diffusive_Flux
+  public :: Diffusive_Flux, Diffusive_Flux_List, Diffusive_Flux_Pack
   public :: Compute_Diffusive_Flux
+  public :: Diffusive_Face_State, Compute_Diffusive_Flux_St   ! mr-conn-fast (Lib_BC BC_Connection_Visc_fast)
 
   integer, parameter :: NTMAX = 10000
   ! THOR mechanism compile-time dims: per-primitive local arrays scalarize to
@@ -81,19 +82,47 @@ contains
 #undef DCUF_KI
 #undef DCUF_KJ
 #undef DCUF_KK
+  ! The multirate list twins (diff_cuf_list_kernel.inc): one kernel for the three directions of a level's face lists.
+! the block-pack twins (MOSE_Pack_m): diff_cuf_*_pack and diff_cuf_*_pack_mc, same two instantiations
+#define DCUF_PKI diff_cuf_i_pack
+#define DCUF_PKJ diff_cuf_j_pack
+#define DCUF_PKK diff_cuf_k_pack
+#include "diff_cuf_pack_kernels.inc"
+#undef DCUF_PKI
+#undef DCUF_PKJ
+#undef DCUF_PKK
+#define MOSE_MCDIFF_KERNEL
+#define DCUF_PKI diff_cuf_i_pack_mc
+#define DCUF_PKJ diff_cuf_j_pack_mc
+#define DCUF_PKK diff_cuf_k_pack_mc
+#include "diff_cuf_pack_kernels.inc"
+#undef MOSE_MCDIFF_KERNEL
+#undef DCUF_PKI
+#undef DCUF_PKJ
+#undef DCUF_PKK
+
+#define DCUF_KL diff_cuf_list
+#include "diff_cuf_list_kernel.inc"
+#undef DCUF_KL
+#define MOSE_MCDIFF_KERNEL
+#define DCUF_KL diff_cuf_list_mc
+#include "diff_cuf_list_kernel.inc"
+#undef MOSE_MCDIFF_KERNEL
+#undef DCUF_KL
 
   ! ============================================================================
   ! HOST LAUNCHER — CUF pass-1 (host_data) + OpenACC pass-2 (diffusive sign).
   ! Replaces Diffusive_Flux_w_blk when MOSE_DIFF_W_CUF is ON.
   ! ============================================================================
   subroutine Diffusive_Flux ( b, Res, fm1, fm2, fm3, M, yn, rho_c, T_c, &
-                                     n)
+                                     n, lo, hi )
     use MOSE_Global_m,   only: gc, nprim, nsc, nu, nv, nw, np, nt, nrans, RANS, VISC
     use MOSE_Field_m,    only: P_flat, R_flat, field_block_index_params, ncell_total, rho_c_f, T_c_f
     use MOSE_Lib_RANS,   only: sc_dev, sct_dev, prt_dev, stress_dev, eddy_dev, mcdiff_dev
     use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
     integer, intent(in) :: b
     integer, dimension(3), intent(in) :: n
+    integer, dimension(3), intent(in) :: lo, hi   ! the cells whose faces are computed: the block, or a multirate box
     real(R8), dimension(nprim, 1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(inout) :: Res
     real(R8), dimension(4, 0:n(1), n(2), n(3)), intent(in) :: fm1
     real(R8), dimension(4, n(1), 0:n(2), n(3)), intent(in) :: fm2
@@ -115,11 +144,11 @@ contains
     strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
 
     ! ---- i-direction ----
-    o1 = 1; h1 = n1-1; o2 = 1; h2 = n2; o3 = 1; h3 = n3
+    o1 = max(lo(1)-1, 1); h1 = min(hi(1), n1-1); o2 = lo(2); h2 = hi(2); o3 = lo(3); h3 = hi(3)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
-    call Diffusive_Face_Thermo_Fill ( b, 1, n)   ! sync-queue kernel: complete (or stream-ordered) before pass-1 reads tface
+    call Diffusive_Face_Thermo_Fill ( b, 1, n, o1, h1, o2, h2, o3, h3 )   ! sync-queue kernel: complete (or stream-ordered) before pass-1 reads tface
     !$acc host_data use_device(P_flat, dfhat, fm1, M, yn, rho_c_f, T_c_f, tface)
     if (mcdiff_dev) then
     call diff_cuf_i_mc<<<grid,tblock,0,strm>>>(P_flat, dfhat, fm1, M, yn, rho_c_f, T_c_f, tface, &
@@ -137,11 +166,11 @@ contains
 
     ! ---- j-direction ----
     end if
-    o1 = 1; h1 = n1; o2 = 1; h2 = n2-1; o3 = 1; h3 = n3
+    o1 = lo(1); h1 = hi(1); o2 = max(lo(2)-1, 1); h2 = min(hi(2), n2-1); o3 = lo(3); h3 = hi(3)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
-    call Diffusive_Face_Thermo_Fill ( b, 2, n)
+    call Diffusive_Face_Thermo_Fill ( b, 2, n, o1, h1, o2, h2, o3, h3 )
     !$acc host_data use_device(P_flat, dfhat_j, fm2, M, yn, rho_c_f, T_c_f, tface)
     if (mcdiff_dev) then
     call diff_cuf_j_mc<<<grid,tblock,0,strm>>>(P_flat, dfhat_j, fm2, M, yn, rho_c_f, T_c_f, tface, &
@@ -156,11 +185,11 @@ contains
 
     ! ---- k-direction ----
     end if
-    o1 = 1; h1 = n1; o2 = 1; h2 = n2; o3 = 1; h3 = n3-1
+    o1 = lo(1); h1 = hi(1); o2 = lo(2); h2 = hi(2); o3 = max(lo(3)-1, 1); h3 = min(hi(3), n3-1)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
-    call Diffusive_Face_Thermo_Fill ( b, 3, n)
+    call Diffusive_Face_Thermo_Fill ( b, 3, n, o1, h1, o2, h2, o3, h3 )
     !$acc host_data use_device(P_flat, dfhat_k, fm3, M, yn, rho_c_f, T_c_f, tface)
     if (mcdiff_dev) then
     call diff_cuf_k_mc<<<grid,tblock,0,strm>>>(P_flat, dfhat_k, fm3, M, yn, rho_c_f, T_c_f, tface, &
@@ -214,12 +243,13 @@ contains
   !> derivation, so only those are averaged. Faces are strictly interior (no ghost
   !> reads). Lazy alloc: nface_max is set by diffusive_alloc_fhat, which Fluxes
   !> runs before any per-block launcher reaches here.
-  subroutine Diffusive_Face_Thermo_Fill ( b, dir, n)
+  subroutine Diffusive_Face_Thermo_Fill ( b, dir, n, o1, h1, o2, h2, o3, h3 )
     use MOSE_Global_m, only: nsc, np
     use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_cp_dev, co_k_mi_lam_Wilke_dev, co_DS_expr_dev
     use MOSE_Lib_RANS, only: mcdiff_dev, prl_dev
     integer, intent(in) :: b, dir
     integer, dimension(3), intent(in) :: n
+    integer, intent(in) :: o1, h1, o2, h2, o3, h3   ! the faces of direction dir (the launcher's range)
     integer  :: i, j, k, s, f, c1, c2, boff, pi, pj, T_i, Tint(2)
     real(R8) :: Prim(NPRIM_DEV), rho, Rgas, T, Tdiff, cp, mil, kl
     real(R8) :: Dk(NPRIM_DEV)   ! DIFF_MC: the face D_k (co_DS_expr_dev), columns 6:5+nsc
@@ -248,9 +278,9 @@ contains
     case (1)
       !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
-      do k = 1, n(3)
-      do j = 1, n(2)
-      do i = 1, nb1_-1
+      do k = o3, h3
+      do j = o2, h2
+      do i = o1, h1
         c1 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
         c2 = c1 + 1
         do s = 1, nsc
@@ -278,9 +308,9 @@ contains
     case (2)
       !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
-      do k = 1, n(3)
-      do j = 1, nb2_-1
-      do i = 1, n(1)
+      do k = o3, h3
+      do j = o2, h2
+      do i = o1, h1
         c1 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
         c2 = c1 + pi
         do s = 1, nsc
@@ -308,9 +338,9 @@ contains
     case (3)
       !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
-      do k = 1, nb3_-1
-      do j = 1, n(2)
-      do i = 1, n(1)
+      do k = o3, h3
+      do j = o2, h2
+      do i = o1, h1
         c1 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
         c2 = c1 + pi*pj
         do s = 1, nsc
@@ -337,6 +367,226 @@ contains
       end do ; end do ; end do
     end select
   end subroutine Diffusive_Face_Thermo_Fill
+
+
+  !> The face thermo of direction dir of batch ib of the block pack (MOSE_Pack_m): the statements of
+  !> Diffusive_Face_Thermo_Fill on the faces of every block of the batch, one gang of 128 per CUDA-block entry of the
+  !> batch table (the face is the one the pack flux kernels read at the same row of tfp). Sync construct on the default
+  !> queue, in order with the CUF launches of Diffusive_Flux_Pack on the sync queue's stream.
+  subroutine Diffusive_Face_Thermo_Fill_Pack ( ib, dir )
+    use MOSE_Global_m, only: nsc, np, gc
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_cp_dev, co_k_mi_lam_Wilke_dev, co_DS_expr_dev
+    use MOSE_Lib_RANS, only: mcdiff_dev, prl_dev
+    use MOSE_Pack_m
+    integer, intent(in) :: ib, dir
+    integer  :: e, tt, t_, s, f, c1, c2, T_i, Tint(2), p, n1, n2, n3, boff, pi, pj, i, j, k, ni_, nj_, nk_, rem_, cb0, ncb, sa, of
+    real(R8) :: Prim(NPRIM_DEV), rho, Rgas, T, Tdiff, cp, mil, kl
+    real(R8) :: Dk(NPRIM_DEV)
+    logical  :: mcd_
+    mcd_ = mcdiff_dev
+    cb0 = cb_n(0, dir, ib); ncb = cb_n(1, dir, ib)
+    if ( ncb == 0 ) return
+    !$acc parallel loop gang vector_length(128) present(P_flat, tfp, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofh) &
+    !$acc&  private(p, n1, n2, n3, boff, pi, pj, ni_, nj_, nk_, sa, of)
+    do e = 1, ncb
+      p = cb_p(cb0+e)
+      n1 = bt_n1(p); n2 = bt_n2(p); n3 = bt_n3(p); boff = bt_boff(p); pi = bt_pi(p); pj = bt_pj(p)
+      of = bt_ofh(dir, p)
+      if ( dir == 1 ) then
+        ni_ = n1 - 1; nj_ = n2; nk_ = n3; sa = 1
+      else if ( dir == 2 ) then
+        ni_ = n1; nj_ = n2 - 1; nk_ = n3; sa = pi
+      else
+        ni_ = n1; nj_ = n2; nk_ = n3 - 1; sa = pi*pj
+      end if
+      !$acc loop vector private(Prim, Tint, Dk, t_, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, i, j, k, rem_)
+      do tt = 1, PACK_NT
+        t_ = cb_t0(cb0+e) + tt
+        if ( t_ <= ni_*nj_*nk_ ) then
+          i    = mod(t_-1, ni_) + 1
+          rem_ = (t_-1) / ni_
+          j    = mod(rem_, nj_) + 1
+          k    = rem_ / nj_ + 1
+          c1 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
+          c2 = c1 + sa
+          do s = 1, nsc
+            Prim(s) = 0.5_R8 * ( P_flat(c1,s) + P_flat(c2,s) )
+          end do
+          Prim(np) = 0.5_R8 * ( P_flat(c1,np) + P_flat(c2,np) )
+          call co_rotot_Rtot_dev ( Prim(1:nsc), rho, Rgas )
+          T = Prim(np) / ( rho * Rgas )
+          T_i = int(T)
+          Tdiff = T - T_i
+          Tint(1) = T_i
+          Tint(2) = T_i + 1
+          cp = f_cp_dev ( Prim(1:nsc), Tint, Tdiff, rho )
+          call co_k_mi_lam_Wilke_dev ( Prim(1:nsc), rho, Tint, Tdiff, mil, kl )
+          if ( dir == 1 ) then
+            f = of + (i-1) + (j-1)*(n1-1) + (k-1)*(n1-1)*n2 + 1
+          else if ( dir == 2 ) then
+            f = of + (i-1) + (j-1)*n1 + (k-1)*n1*(n2-1) + 1
+          else
+            f = of + (i-1) + (j-1)*n1 + (k-1)*n1*n2 + 1
+          end if
+          if (prl_dev > 0d0) kl = mil*cp/prl_dev   ! [MOSE-Physics] prandtl
+          tfp(f,1) = rho; tfp(f,2) = T; tfp(f,3) = mil; tfp(f,4) = kl; tfp(f,5) = cp
+          if (mcd_) then
+            call co_DS_expr_dev ( Prim(1:nsc), rho, Tint, Tdiff, Prim(np), Dk(1:nsc) )
+            do s = 1, nsc
+              tfp(f,5+s) = Dk(s)
+            end do
+          end if
+        end if
+      end do
+    end do
+  end subroutine Diffusive_Face_Thermo_Fill_Pack
+
+  !> The diffusive pass 1 of batch ib of the block pack (MOSE_Pack_m): per direction the face thermo of the batch
+  !> (Diffusive_Face_Thermo_Fill_Pack), then the pack flux kernel (diff_cuf_*_pack, or the _mc twin), on the sync queue's
+  !> stream as Diffusive_Flux. Six launches for the batch.
+  subroutine Diffusive_Flux_Pack ( ib )
+    use MOSE_Global_m,   only: gc, nprim, RANS, VISC
+    use MOSE_Field_m,    only: P_flat, ncell_total, rho_c_f, T_c_f
+    use MOSE_Lib_RANS,   only: sc_dev, sct_dev, prt_dev, stress_dev, eddy_dev, mcdiff_dev
+    use MOSE_Pack_m
+    use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
+    integer, intent(in) :: ib
+    integer(kind=cuda_stream_kind) :: strm
+    type(dim3) :: grid, tblock
+    integer :: nl
+    if (.not. VISC) return
+    call dcuf_init_tables()
+    nl = size(bt_n1)
+    tblock = dim3(PACK_NT, 1, 1)
+    strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
+    if ( pbat(ib)%ncb(1) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(1), 1, 1)
+      call Diffusive_Face_Thermo_Fill_Pack ( ib, 1 )
+      !$acc host_data use_device(P_flat, dfhp1, fm1p, Mp, ynp, rho_c_f, T_c_f, tfp, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm1, bt_ofh)
+      if (mcdiff_dev) then
+      call diff_cuf_i_pack_mc<<<grid,tblock,0,strm>>>(P_flat, dfhp1, fm1p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp1, size(fm1p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,1,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm1, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      else
+      call diff_cuf_i_pack<<<grid,tblock,0,strm>>>(P_flat, dfhp1, fm1p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp1, size(fm1p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,1,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm1, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      end if
+      !$acc end host_data
+    end if
+    if ( pbat(ib)%ncb(2) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(2), 1, 1)
+      call Diffusive_Face_Thermo_Fill_Pack ( ib, 2 )
+      !$acc host_data use_device(P_flat, dfhp2, fm2p, Mp, ynp, rho_c_f, T_c_f, tfp, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm2, bt_ofh)
+      if (mcdiff_dev) then
+      call diff_cuf_j_pack_mc<<<grid,tblock,0,strm>>>(P_flat, dfhp2, fm2p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp2, size(fm2p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,2,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm2, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      else
+      call diff_cuf_j_pack<<<grid,tblock,0,strm>>>(P_flat, dfhp2, fm2p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp2, size(fm2p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,2,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm2, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      end if
+      !$acc end host_data
+    end if
+    if ( pbat(ib)%ncb(3) > 0 ) then
+      grid = dim3(pbat(ib)%ncb(3), 1, 1)
+      call Diffusive_Face_Thermo_Fill_Pack ( ib, 3 )
+      !$acc host_data use_device(P_flat, dfhp3, fm3p, Mp, ynp, rho_c_f, T_c_f, tfp, cb_p, cb_t0, bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm3, bt_ofh)
+      if (mcdiff_dev) then
+      call diff_cuf_k_pack_mc<<<grid,tblock,0,strm>>>(P_flat, dfhp3, fm3p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp3, size(fm3p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,3,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm3, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      else
+      call diff_cuf_k_pack<<<grid,tblock,0,strm>>>(P_flat, dfhp3, fm3p, Mp, ynp, rho_c_f, T_c_f, tfp, ncell_total, nfp3, size(fm3p,2), ntfp, &
+           cb_p, cb_t0, cb_n(0,3,ib), bt_n1, bt_n2, bt_n3, bt_boff, bt_pi, bt_pj, bt_ofm3, bt_ofh, nl, gc, &
+           RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+      end if
+      !$acc end host_data
+    end if
+  end subroutine Diffusive_Flux_Pack
+
+  !> The diffusive pass 1 of a multirate level on its face lists (Mod_Fluxes Fluxes_List): per direction the face thermo
+  !> of the list (Diffusive_Face_Thermo_Fill_List), then the flux kernel, one launch each over every local block.
+  subroutine Diffusive_Flux_List ( fl )
+    use MOSE_Lib_Multirate_Base, only: mr_fl_type
+    type(mr_fl_type), intent(inout) :: fl(3)
+    integer :: d
+    if (.not. VISC) return
+    call dcuf_init_tables()
+    do d = 1, 3
+      if (fl(d)%n == 0) cycle
+      call Diffusive_Face_Thermo_Fill_List ( fl(d)%tf, fl(d)%c, fl(d)%sa, fl(d)%n, size(fl(d)%tf, 2) )
+      call diff_list_launch ( fl(d)%dfh, fl(d)%n, d, fl(d)%c, fl(d)%sa, fl(d)%sb, fl(d)%sc, fl(d)%fm, fl(d)%mm, fl(d)%yn, &
+                              fl(d)%tf, size(fl(d)%tf, 2) )
+    end do
+  end subroutine Diffusive_Flux_List
+
+  subroutine diff_list_launch ( dfh, ne, d, c, sa, sb, sc, fmg, mmg, yng, tf, ntf )
+    use MOSE_Global_m,   only: nprim, RANS
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use MOSE_Field_m,    only: ncell_total, rho_c_f, T_c_f
+    use MOSE_Lib_RANS,   only: sc_dev, sct_dev, prt_dev, stress_dev, eddy_dev, mcdiff_dev
+    use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
+    integer,  intent(in)    :: ne, d, ntf, c(ne), sa(ne), sb(ne), sc(ne)
+    real(R8), intent(in)    :: fmg(4, ne), mmg(3, 3, 2, ne), yng(2, ne), tf(ne, ntf)
+    real(R8), intent(inout) :: dfh(ne, nprim)
+    integer(kind=cuda_stream_kind) :: strm
+    type(dim3) :: grid, tblock
+    tblock = dim3(128, 1, 1); grid = dim3((ne + 127)/128, 1, 1)
+    strm = acc_get_cuda_stream(int(mr_q, acc_handle_kind))   ! the stage queue's stream (mr-async; the sync queue's outside a list stage)
+    !$acc host_data use_device(P_flat, dfh, c, sa, sb, sc, fmg, mmg, yng, rho_c_f, T_c_f, tf)
+    if (mcdiff_dev) then
+    call diff_cuf_list_mc<<<grid,tblock,0,strm>>>(P_flat, dfh, ne, d, c, sa, sb, sc, fmg, mmg, yng, rho_c_f, T_c_f, &
+         tf, ncell_total, RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+    else
+    call diff_cuf_list<<<grid,tblock,0,strm>>>(P_flat, dfh, ne, d, c, sa, sb, sc, fmg, mmg, yng, rho_c_f, T_c_f, &
+         tf, ncell_total, RANS, stress_dev, eddy_dev, sc_dev, sct_dev, prt_dev)
+    end if
+    !$acc end host_data
+  end subroutine diff_list_launch
+
+  !> The face thermo of a face list (Diffusive_Face_Thermo_Fill on the faces of the list: the face of position e between
+  !> the cells c(e) and c(e) + sa(e)), the statements of the box fill verbatim.
+  subroutine Diffusive_Face_Thermo_Fill_List ( tf, c, sa, ne, ntf )
+    use MOSE_Global_m, only: nsc, np
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_cp_dev, co_k_mi_lam_Wilke_dev, co_DS_expr_dev
+    use MOSE_Lib_RANS, only: mcdiff_dev, prl_dev
+    integer,  intent(in)    :: ne, ntf, c(ne), sa(ne)
+    real(R8), intent(inout) :: tf(ne, ntf)
+    integer  :: e, s, c1, c2, T_i, Tint(2)
+    real(R8) :: Prim(NPRIM_DEV), rho, Rgas, T, Tdiff, cp, mil, kl
+    real(R8) :: Dk(NPRIM_DEV)
+    logical  :: mcd_
+    mcd_ = mcdiff_dev
+    !$acc parallel loop gang vector async(mr_q) present(P_flat, tf, c, sa) &
+    !$acc&  private(Prim, Tint, s, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
+    do e = 1, ne
+      c1 = c(e)
+      c2 = c1 + sa(e)
+      do s = 1, nsc
+        Prim(s) = 0.5_R8 * ( P_flat(c1,s) + P_flat(c2,s) )
+      end do
+      Prim(np) = 0.5_R8 * ( P_flat(c1,np) + P_flat(c2,np) )
+      call co_rotot_Rtot_dev ( Prim(1:nsc), rho, Rgas )
+      T = Prim(np) / ( rho * Rgas )
+      T_i = int(T)
+      Tdiff = T - T_i
+      Tint(1) = T_i
+      Tint(2) = T_i + 1
+      cp = f_cp_dev ( Prim(1:nsc), Tint, Tdiff, rho )
+      call co_k_mi_lam_Wilke_dev ( Prim(1:nsc), rho, Tint, Tdiff, mil, kl )
+      if (prl_dev > 0d0) kl = mil*cp/prl_dev   ! [MOSE-Physics] prandtl
+      tf(e,1) = rho; tf(e,2) = T; tf(e,3) = mil; tf(e,4) = kl; tf(e,5) = cp
+      if (mcd_) then
+        call co_DS_expr_dev ( Prim(1:nsc), rho, Tint, Tdiff, Prim(np), Dk(1:nsc) )
+        do s = 1, nsc
+          tf(e,5+s) = Dk(s)
+        end do
+      end if
+    end do
+  end subroutine Diffusive_Face_Thermo_Fill_List
 
 
 
@@ -481,6 +731,131 @@ contains
 
 
     end subroutine Compute_Diffusive_Flux
-  
-  
+
+
+    !> mr-conn-fast (08/11): Compute_Diffusive_Flux in two parts, for BC_Connection_Visc_fast, which calls it twice with the
+    !> same face state Prim. This part depends on Prim only (thermo, transport, the laminar mixture diffusion): the lines of
+    !> Compute_Diffusive_Flux verbatim, so the two calls share one evaluation and get the same values.
+    subroutine Diffusive_Face_State ( Prim, rho, Tint, Tdiff, cp, mil, kl, Dml )
+      !$acc routine seq
+      use MOSE_Global_m
+      use MOSE_Lib_RANS, only: prl_dev, mcdiff_dev
+      use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_cp_dev, co_k_mi_lam_Wilke_dev, co_DS_expr_dev
+      implicit none
+      real(R8), intent(in)  :: Prim(NPRIM_DEV)
+      real(R8), intent(out) :: rho, Tdiff, cp, mil, kl, Dml(NPRIM_DEV)
+      integer,  intent(out) :: Tint(2)
+      integer  :: T_i
+      real(R8) :: Rgas, T
+
+      call co_rotot_Rtot_dev ( Prim(1:nsc), rho, Rgas )
+      T = Prim(np) / ( rho * Rgas )
+
+      T_i     = int(T)
+      Tdiff   = T - T_i
+      Tint(1) = T_i
+      Tint(2) = T_i + 1
+
+      cp = f_cp_dev ( Prim(1:nsc), Tint, Tdiff, rho )
+      call co_k_mi_lam_Wilke_dev ( Prim(1:nsc), rho, Tint, Tdiff, mil, kl )
+      if (prl_dev > 0d0) kl = mil*cp/prl_dev   ! [MOSE-Physics] prandtl (MOSE_open Lib_Diffusive)
+      if (mcdiff_dev) then
+        call co_DS_expr_dev ( Prim(1:nsc), rho, Tint, Tdiff, Prim(np), Dml(1:nsc) )
+      else
+        Dml(1:nsc) = 0d0
+      end if
+    end subroutine Diffusive_Face_State
+
+
+    !> mr-conn-fast: the rest of Compute_Diffusive_Flux (from the eddy viscosity on), verbatim, on the face state of
+    !> Diffusive_Face_State.
+    subroutine Compute_Diffusive_Flux_St ( Prim, Gradient, area, normal, waldis, rho, Tint, Tdiff, cp, mil, kl, Dml, Flux )
+      !$acc routine seq
+      use MOSE_Global_m
+      use FLINT_Lib_Thermodynamic
+      use MOSE_Lib_RANS
+      use MOSE_Mod_Fluid
+      use MOSE_Mod_SST, only: SST_Eddy_Viscosity, SST_RANS_Diffusive_Flux
+      use MOSE_Mod_Spalart, only: Spalart_Eddy_Viscosity, Spalart_RANS_Diffusive_Flux
+      use MOSE_Mod_Wilcox2006, only: Wilcox2006_Eddy_Viscosity, Wilcox2006_RANS_Diffusive_Flux
+      use MOSE_Lib_RANS, only: eddy_dev
+      implicit none
+      real(R8), intent(in)  :: Prim(NPRIM_DEV), Gradient(NPRIM_DEV,3), area, normal(3), waldis
+      real(R8), intent(in)  :: rho, Tdiff, cp, mil, kl, Dml(NPRIM_DEV)
+      integer,  intent(in)  :: Tint(2)
+      real(R8), intent(out) :: Flux(NPRIM_DEV)
+      integer  :: s, dd
+      real(R8) :: mie, kappa
+      real(R8) :: Dm(NPRIM_DEV), stress(3), DiffHFlux, DmGradYi, hh, hh1, hh2
+      real(R8) :: Gvel(3,3), Gkw(2,3)
+
+      ! Eddy viscosity
+      mie = 0d0
+      do dd = 1, 3
+        Gvel(1,dd) = Gradient(nu,dd); Gvel(2,dd) = Gradient(nv,dd); Gvel(3,dd) = Gradient(nw,dd)
+      end do
+      if (RANS) then
+        if (eddy_dev == 2) then
+          call Spalart_Eddy_Viscosity ( mie, Prim(nt:nprim), mil, rho, Gvel, waldis )
+        else if (eddy_dev == 3) then
+          call Wilcox2006_Eddy_Viscosity ( mie, Prim(nt:nprim), mil, rho, Gvel, waldis )
+        else
+          call SST_Eddy_Viscosity ( mie, Prim(nt:nprim), mil, rho, Gvel, waldis )
+        end if
+      end if
+
+      if (mcdiff_dev) then
+        Dm(1:nsc) = Dml(1:nsc)
+        if (mie > 0d0) Dm(1:nsc) = Dm(1:nsc) + mie/(rho*sct_dev)
+      else
+      Dm (1:nsc) = ( mil/sc_dev + mie/sct_dev ) / rho
+      end if
+      kappa = kl + mie*cp/prt_dev
+      if (stress_dev == 2) then
+        Stress = Stress_Vector_2eq ( Gvel, normal, mil, mie, prim(nt:nprim) )
+      else
+        Stress = Stress_Vector_Std ( Gvel, normal, mil, mie, prim(nt:nprim) )
+      end if
+
+      DiffHFlux = 0.0d0
+      Flux = 0.0d0
+
+      do s = 1, nsc
+        DmGradYi  = Dm(s) * dot_product ( Gradient(s,:), normal )     ! Dm * dyi/dn
+        Flux(s) = rho * area * DmGradYi                               ! rho * Dm *dyi/dn * Area
+        hh1 = h_tab ( Tint(1), s )
+        hh2 = h_tab ( Tint(2), s )
+        hh  = hh1 + Tdiff * ( hh2 - hh1 )
+        DiffHFlux = DiffHFlux + DmGradYi * hh
+      enddo
+
+      Flux(1:nsc) = Flux(1:nsc) - sum(Flux(1:nsc))*Prim(1:nsc)/rho
+
+      Flux(nu:nw) = area * Stress
+
+      Flux(np) = area * ( dot_product ( Stress, Prim(nu:nw) ) + &
+                 kappa * dot_product ( Gradient(np,:), normal ) + DiffHFlux * rho )
+
+      if (RANS) then
+        if (eddy_dev == 2) then
+          do dd = 1, 3
+            Gkw(1,dd) = Gradient(nt,dd)
+          end do
+          call Spalart_RANS_Diffusive_Flux ( Flux(nt:nprim), Prim(nt:nprim), mil, Gvel, Gkw(1:nrans,1:3), rho, area, normal, waldis )
+        else
+          do dd = 1, 3
+            Gkw(1,dd) = Gradient(nt,dd); Gkw(2,dd) = Gradient(min(nt+1,nprim),dd)
+          end do
+          if (eddy_dev == 3) then
+            call Wilcox2006_RANS_Diffusive_Flux ( Flux(nt:nprim), Prim(nt:nprim), mil, Gvel, Gkw, rho, area, normal, waldis )
+          else
+            call SST_RANS_Diffusive_Flux ( Flux(nt:nprim), Prim(nt:nprim), mil, &
+                                           Gvel, Gkw, &
+                                           rho, area, normal, waldis )
+          end if
+        end if
+      end if
+    end subroutine Compute_Diffusive_Flux_St
+
+
 end module MOSE_Mod_Diffusive

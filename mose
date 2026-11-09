@@ -97,7 +97,10 @@ OPEN_KEYS = {
 # The MOSE_open keys the code translates at start-up (IO_Ini_Open.f90): no warning for them in that dialect.
 OPEN_TRANSLATED = {
     'MOSE-Parameters': ('newrun', 'iter-threshold', 'time-threshold', 'res-threshold'),
-    'MOSE-Numerics': ('cfl', 'vnn', 'cfl-rise-threshold', 'time-accurate', 'time-scheme', 'integration-variables', 'irs',
+    'MOSE-Numerics': ('cfl', 'vnn', 'cfl-rise-threshold', 'dt-rule', 'time-accurate', 'time-scheme', 'integration-variables', 'irs',
+                      'multirate', 'mr-ratio', 'mr-safety', 'mr-wall-safety', 'mr-wall-rows', 'mr-lmax', 'mr-repart',
+                      'mr-repart-hcap', 'mr-print', 'mr-profile', 'mr-boxes', 'mr-list-level', 'mr-list-records-level', 'mr-ghost-near',
+                      'mr-land', 'mr-cons-halo', 'mr-depth', 'mr-margin', 'mr-nonlocal', 'mr-octaves',
                       'irs-beta', 'space-reconstruction', 'flux-limiter', 'shock-detector', 'riemann-solver',
                       'preconditioning-eps-min', 'preconditioning-Uref', 'preconditioning-Mach', 'preconditioning-Ur-min',
                       'preconditioning-Ur-factor', 'preconditioning-Ur-smooth'),
@@ -207,8 +210,7 @@ def read_case(case, src):
     if not os.path.exists(os.path.join(case, 'INPUT', 'bc.txt')):
         err('INPUT/bc.txt missing: the boundary conditions')
     # the features this version does not have (the binary stops on them too: IO_Ini, Stop_On_Removed_Keys)
-    for k, what in (('multirate', 'multirate (branch multirate of DIMA-THRUST/MOSE)'),
-                    ('j-implicit', 'line-implicit operator (last in 85e3b63 of mose-launcher)'),
+    for k, what in (('j-implicit', 'line-implicit operator (last in 85e3b63 of mose-launcher)'),
                     ('imex', 'IMEX integrator (last in 85e3b63 of mose-launcher)')):
         v = ini_get(secs, 'MOSE-scheme', k)
         if v is not None and v.strip().lower() not in ('f', 'false', '.false.'):

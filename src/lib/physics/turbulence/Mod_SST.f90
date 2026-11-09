@@ -1,5 +1,6 @@
 !> @brief Module for Kappa-Omega SST (2003) model. see https://turbmodels.larc.nasa.gov/sst.html.
 module MOSE_Mod_SST
+  use MOSE_Lib_Multirate_Base, only: mr_q   ! expl-async: the stage queue of the block kernels
   implicit none
   real(kind=8), parameter, public :: &
   sigma_k1 = 0.85d0, &
@@ -41,11 +42,12 @@ contains
     use MOSE_Global_m, only: ROTATING_FRAME
     use MOSE_Lib_RotatingFrame, only: obj_rot
     use MOSE_Lib_SpalartShur, only: RC_Prepare
+    use MOSE_Lib_Multirate_Base, only: mr_block_active, mr_nbox, mr_get_box, mr_dt_sel, mr_list_on, mrcl, obj_mr
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
     ! Local
-    integer :: b
+    integer :: b, ib, lo(3), hi(3)
 
     ! One launch (`!$omp single`): SST_Source_Terms runs inside the Mod_Explicit `!$omp parallel` region.
     !$omp single
@@ -58,9 +60,17 @@ contains
                           domain % blk(b) % dtlocal, obj_rans % point_implicit, obj_rans % k_energy_coupling, &
                           ROTATING_FRAME, obj_rot % Omega_vec, domain % blk(b) % dim )
       end do
+    else if ( mr_list_on() ) then   ! a list level of a multirate stage: one launch over the level's cells of every block
+      if ( mrcl(obj_mr%lcur)%n > 0 ) &
+        call SST_List ( mrcl(obj_mr%lcur)%ijk, mrcl(obj_mr%lcur)%bo, mrcl(obj_mr%lcur)%pp, mrcl(obj_mr%lcur)%met, &
+                        mrcl(obj_mr%lcur)%vol, mrcl(obj_mr%lcur)%wd, mrcl(obj_mr%lcur)%n, mr_dt_sel(), &
+                        obj_rans % point_implicit, obj_rans % k_energy_coupling, ROTATING_FRAME, obj_rot % Omega_vec )
     else
     do b = 1, domain % nb
       if ( .not. ( is_local_block(b) ) ) cycle
+      if ( .not. mr_block_active(b) ) cycle   ! multirate stage: the boxes of the stage's level, its cells only
+      do ib = 1, mr_nbox(b)
+        call mr_get_box ( b, ib, domain%blk(b)%dim, lo, hi )
         call SST_Blk ( SSTPASS,                  &
                            domain % blk(b) % r,      &
                            domain % blk(b) % m_f,    &
@@ -72,7 +82,8 @@ contains
                            obj_rans % k_energy_coupling, &
                            ROTATING_FRAME,           &
                            obj_rot % Omega_vec,      &
-                           domain % blk(b) % dim )
+                           domain % blk(b) % dim, lo, hi, mr_dt_sel() )
+      end do
     end do
     end if
     !$omp end single
@@ -91,7 +102,7 @@ contains
   !>  - Grad rows are gathered into contiguous gradk_c/gradw_c before compute_F
   !>    (the nvfortran strided-section gotcha, same as SST_RANS_Diffusive_Flux).
   subroutine SST_Blk ( SSTARG, Res, Metric, Volume, WDist, rho_c, mil_c, dtl, pimp, &
-                           k_energy_coupling, rotating_frame, omega_vec, n)
+                           k_energy_coupling, rotating_frame, omega_vec, n, lo, hi, hsel )
     use MOSE_Global_m
     use MOSE_Mod_Fluid, only: Strain_Tensor, Vorticity_Vector, Vorticity_Tensor
     use MOSE_Field_m, only: P_flat, R_flat, ncell_total, field_block_index_params, rho_c_f, mil_c_f
@@ -99,6 +110,8 @@ contains
     implicit none
     integer, intent(in) :: n(3)
     integer, intent(in) :: b
+    integer, intent(in) :: lo(3), hi(3)   ! the cells: the whole block, or a box of a multirate stage
+    real(kind=8), intent(in) :: hsel      ! > 0: only the cells with dtl == hsel (a multirate level); else all
     integer :: boff, pi, pj
     real(kind=8), dimension(nprim, 1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(inout) :: Res
     real(kind=8), dimension(3, 3, 1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(in) :: Metric
@@ -119,20 +132,24 @@ contains
     ! Dims as scalars -- a dummy array referenced inside the acc region
     ! is implicitly copy()d per launch (upload+download+sync); scalars ride the
     ! launch parameters for free.
-    integer :: nb1_, nb2_, nb3_
-    real(kind=8) :: ov1_, ov2_, ov3_
+    integer :: nb1_, nb2_, nb3_, lo1_, hi1_, lo2_, hi2_, lo3_, hi3_
+    real(kind=8) :: ov1_, ov2_, ov3_, hsel_
     nb1_ = n(1); nb2_ = n(2); nb3_ = n(3)
+    lo1_ = lo(1); hi1_ = hi(1); lo2_ = lo(2); hi2_ = hi(2); lo3_ = lo(3); hi3_ = hi(3); hsel_ = hsel
     ov1_ = omega_vec(1); ov2_ = omega_vec(2); ov3_ = omega_vec(3)
 
     call field_block_index_params(b, boff, pi, pj)
     !$acc data copy(Res) copyin(Metric, Volume, WDist, rho_c, mil_c, dtl)
-    !$acc parallel loop collapse(3) gang vector &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) &
     !$acc&  present(P_flat, R_flat, Res, Metric, Volume, WDist, rho_c, mil_c, dtl, rho_c_f, mil_c_f) &
     !$acc&  private(Gtmp, Gradvel, Sij, Wij, vort, Grw, Grad, gradk_c, gradw_c, &
     !$acc&          Prod, Diss, Source, F)
-    do k = 1, n(3)
-    do j = 1, n(2)
-    do i = 1, n(1)
+    do k = lo3_, hi3_
+    do j = lo2_, hi2_
+    do i = lo1_, hi1_
+      if ( hsel_ > 0.0d0 ) then
+        if ( dtl(i,j,k) /= hsel_ ) cycle
+      end if
 
 #include "sst_body.inc"
 
@@ -142,6 +159,48 @@ contains
     !$acc end data
 
   end subroutine SST_Blk
+
+  !> The SST source on the cell list of a multirate level (list path): the body of SST_Blk (sst_body.inc) per listed cell,
+  !> at the cell's block-local indices with its block's flat offset and row lengths (WR, PS), the metric, volume and wall
+  !> distance gathered by the list, dtl = the level's sub-step (the dtlocal of every cell of the level).
+  subroutine SST_List ( ijk, bo, pp, gmet, gvol, gwd, ne, dtlev, pimp, k_energy_coupling, rotating_frame, omega_vec )
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use MOSE_Global_m
+    use MOSE_Mod_Fluid, only: Strain_Tensor, Vorticity_Vector, Vorticity_Tensor
+    use MOSE_Field_m, only: P_flat, R_flat, ncell_total, rho_c_f, mil_c_f
+    implicit none
+    integer,      intent(in) :: ne, ijk(3, ne), bo(ne), pp(2, ne)
+    real(kind=8), intent(in) :: gmet(3, 3, ne), gvol(ne), gwd(ne), dtlev
+    logical,      intent(in) :: pimp, k_energy_coupling, rotating_frame
+    real(kind=8), intent(in) :: omega_vec(3)
+    integer      :: e, i, j, k, a, c, boff, pi, pj
+    real(kind=8) :: fk_, fw_
+    real(kind=8) :: rho, mil, kap, ome, dist, Gtmp(3,3), Gradvel(3,3), Divel
+    real(kind=8) :: Sij(3,3), S, S2, Wij(3,3), O, O2, mi_t, F(2)
+    real(kind=8) :: vort(3), Grw(2,3), Grad(2,3), gradk_c(3), gradw_c(3)
+    real(kind=8) :: Prod(2), dkDotdw, Diff, beta, gamma, Diss(2), Source(2)
+    real(kind=8) :: sum_im, sum_ip, sum_jm, sum_jp, sum_km, sum_kp
+    real(kind=8) :: ov1_, ov2_, ov3_, dtl_
+    ov1_ = omega_vec(1); ov2_ = omega_vec(2); ov3_ = omega_vec(3); dtl_ = dtlev
+#  define Metric(a_,c_,i_,j_,k_) gmet(a_,c_,e)
+#  define Volume(i_,j_,k_) gvol(e)
+#  define WDist(i_,j_,k_) gwd(e)
+#  define dtl(i_,j_,k_) dtl_
+    !$acc parallel loop gang vector async(mr_q) present(P_flat, R_flat, rho_c_f, mil_c_f, ijk, bo, pp, gmet, gvol, gwd) &
+    !$acc&  private(i, j, k, boff, pi, pj, Gtmp, Gradvel, Sij, Wij, vort, Grw, Grad, gradk_c, gradw_c, &
+    !$acc&          Prod, Diss, Source, F)
+    do e = 1, ne
+      i = ijk(1,e); j = ijk(2,e); k = ijk(3,e)
+      boff = bo(e); pi = pp(1,e); pj = pp(2,e)
+
+#include "sst_body.inc"
+
+    end do
+#  undef Metric
+#  undef Volume
+#  undef WDist
+#  undef dtl
+  end subroutine SST_List
 
 
   !> The -RC twin (MOSE_RC_KERNEL): the stored gradient and the correction factor fr1 on the production.

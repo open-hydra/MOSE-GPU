@@ -6,7 +6,27 @@ module MOSE_Mod_BC_Q2D
   implicit none
 
   private
-  public :: Setup_Q2D_BC_Data
+  public :: Setup_Q2D_BC_Data, Q2D_Ghost_Values, q2d_any_active
+
+  !> The faces of type 667 (MOSE_open 410) on the device (2026-10-29): one slot per local record, in the order of the device
+  !> boundary arrays (bc_perm). q2d_val(:,k) is the state of the file at the stage time (Q2D_Ghost_Values, every ghost fill),
+  !> q2d_has(s,k) = 1 where the file gives the variable s; the ghost kernels (Lib_Extrapolation Ghost_Q2D_Layers/_Edges)
+  !> take the boundary cell for the rest, as MOSE_open Ghost_Q2D_Mapped.
+  integer, public :: q2d_n = -1                       ! -1: not set up yet
+  integer, allocatable, public :: q2d_idx(:), q2d_blk(:), q2d_has(:,:), q2d_dim(:,:)
+  integer, allocatable, public :: q2d_all(:)          ! the slots 1..q2d_n (the ghost kernels take a list of slots)
+  real(R8), allocatable, public :: q2d_val(:,:)
+  integer, allocatable :: q2d_js(:), q2d_grp(:), q2d_ref(:)   ! host: bc(:) index, file group, a record of each group
+  integer :: q2d_ng = 0
+  integer, allocatable :: q2d_blist(:)   ! host: the distinct blocks of the slots (q2d_any_active)
+  ! host: the operands of the time interpolation of every (variable, slot) for the bracket of its group at the last call
+  ! (Q2D_Ghost_Values), re-gathered from bc(:)%q2d_map only when a group's bracket or mode changes
+  integer,  allocatable :: q2d_gi_c(:), q2d_gm_c(:)
+  real(R8), allocatable :: q2d_va(:,:), q2d_vb(:,:), q2d_ta(:,:), q2d_tb(:,:)
+  !> The time of the boundary data: the stage time of MOSE_open (Mod_Explicit: t^n + (i_strang - 1 + theta) * dt / N_strang
+  !> in a time-accurate step), set by Mod_Explicit around the stages; outside them (setup, steady runs) domain%time.
+  real(R8), public :: q2d_time = 0d0
+  logical, public  :: q2d_time_set = .false.
 
 contains
 
@@ -96,6 +116,8 @@ contains
     real(R8), allocatable :: unique_times(:)
     integer :: bc_i1, bc_i2
     logical :: found
+    integer :: nlist, il
+    integer, allocatable :: list(:)
 
     ! --- Open file ---
     open(newunit=u, file=filename, status='old', iostat=ios, action='read')
@@ -227,6 +249,23 @@ contains
 
     ! --- Pass 2: read zone data and distribute to BCs ---
 
+    ! The records of this file, listed once: every zone is distributed over them only (not over every record of the
+    ! domain: 6020 zones x 1.1 M records on the cono wave mesh)
+    nlist = 0
+    do ibc = 1, domain%nbound
+      if (domain%bc(ibc)%type /= 667) cycle
+      if (trim(domain%bc(ibc)%q2d_file) /= trim(filename)) cycle
+      nlist = nlist + 1
+    enddo
+    allocate(list(nlist))
+    nlist = 0
+    do ibc = 1, domain%nbound
+      if (domain%bc(ibc)%type /= 667) cycle
+      if (trim(domain%bc(ibc)%q2d_file) /= trim(filename)) cycle
+      nlist = nlist + 1
+      list(nlist) = ibc
+    enddo
+
     ! Allocate buffers once using max dimensions
     I_max = maxval(zone_I(1:nzones_total))
     J_max = maxval(zone_J(1:nzones_total))
@@ -266,10 +305,9 @@ contains
       enddo
 
       ! Distribute to matching type 667 BCs
-      do ibc = 1, domain%nbound
-        if (domain%bc(ibc)%type /= 667) cycle
+      do il = 1, nlist
+        ibc = list(il)
         if (domain%bc(ibc)%b /= b_zone) cycle
-        if (trim(domain%bc(ibc)%q2d_file) /= trim(filename)) cycle
 
         ! Face-local indices: (i,j,k,f) -> (i1,i2)
         select case (domain%bc(ibc)%f)
@@ -298,7 +336,7 @@ contains
     enddo
 
     close(u)
-    deallocate(node_buf, cell_buf)
+    deallocate(node_buf, cell_buf, list)
     deallocate(varmap, zone_block, zone_tidx, zone_time, zone_I, zone_J, unique_times)
 
   end subroutine Read_Q2D_Tecplot
@@ -342,6 +380,16 @@ contains
         case ('v');  varmap(iv) = nv
         case ('w');  varmap(iv) = nw
         case ('p');  varmap(iv) = np
+      end select
+      if (varmap(iv) /= 0) cycle
+
+      ! (c) the turbulence variables, density-weighted as the solution files hold them, only when the run carries them
+      !     (MOSE_open + rans410_main_2026-10-26.patch): "rhoK" "rhoOmega" (or "kappa" "omega") with nrans = 2, "rhoNuTilde"
+      !     (or "mi_tilde") with nrans = 1; otherwise the columns stay unmapped and the ghost takes the cell's per unit mass
+      select case (trim(lname))
+        case ('rhok', 'kappa');           if (nrans == 2) varmap(iv) = nt
+        case ('rhoomega', 'omega');       if (nrans == 2) varmap(iv) = nt + 1
+        case ('rhonutilde', 'mi_tilde');  if (nrans == 1) varmap(iv) = nt
       end select
     enddo
 
@@ -415,6 +463,195 @@ contains
     enddo
 
   end subroutine parse_zone_header
+
+
+  !> A block with faces of type 667 takes part in this ghost fill (always outside a multirate stage; inside it, a block with
+  !> cells of the stage's level, Lib_Multirate_Base mr_block_active). True before the slots are built.
+  logical function q2d_any_active ()
+    use MOSE_Lib_Multirate_Base, only: mr_block_active
+    integer :: k, m
+    q2d_any_active = .true.
+    if ( q2d_n <= 0 ) return
+    if ( .not. allocated(q2d_blist) ) then
+      allocate ( q2d_blist(0) )
+      do k = 1, q2d_n
+        if ( .not. any(q2d_blist == q2d_blk(k)) ) q2d_blist = [ q2d_blist, q2d_blk(k) ]
+      end do
+    end if
+    q2d_any_active = .false.
+    do m = 1, size(q2d_blist)
+      if ( mr_block_active(q2d_blist(m)) ) then
+        q2d_any_active = .true.
+        return
+      end if
+    end do
+  end function q2d_any_active
+
+
+  !> The faces of type 667 at the time t, into q2d_val on the device: MOSE_open Ghost_Q2D_Mapped, every variable that the
+  !> file gives interpolated as time_bc_type%update (periodic: wrapped into the period; otherwise held at the first and the
+  !> last time of the table). Every record of a file holds the times of the file, so the bracket of t is searched once per
+  !> file (group) and the interpolation of each record is the line of update, with the same operands. The first call
+  !> builds the slots (Q2D_Setup_Slots); with no face of type 667 it returns at once. At the time of the last call q2d_val
+  !> (host and device) already holds the state: the call returns (the next RK2 step starts at the time of the last stage, a
+  !> multirate macro step has many stages at the same time).
+  subroutine Q2D_Ghost_Values ( domain, t )
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    real(R8), intent(in) :: t
+    ! Local
+    integer :: k, g, s, js, i, n, mode
+    real(R8) :: t_, period
+    integer, allocatable :: gi(:), gmode(:)
+    real(R8), allocatable :: gt(:)
+    real(R8), save :: t_last = 0d0
+    logical,  save :: have_last = .false.
+
+    if ( q2d_n < 0 ) call Q2D_Setup_Slots ( domain )
+    if ( q2d_n == 0 ) return
+    if ( have_last .and. t == t_last ) return
+    have_last = .true.; t_last = t
+
+    allocate ( gi(q2d_ng), gmode(q2d_ng), gt(q2d_ng) )
+    do g = 1, q2d_ng
+      associate ( m => domain%bc(q2d_ref(g))%q2d_map(1) )   ! species 1: present in every record (Read_Q2D_Tecplot)
+        n = m%n
+        t_ = t
+        gi(g) = 0
+        if ( m%periodic ) then                     ! MOSE_open: update(time), which wraps the time into the period
+          period = m%time(n) - m%time(1)
+          if ( period > 0d0 ) t_ = m%time(1) + modulo ( t_ - m%time(1), period )
+          mode = 1
+        else if ( t <= m%time(1) ) then
+          mode = 2                                 ! var(1)
+        else if ( t >= m%time(n) ) then
+          mode = 3                                 ! var(n)
+        else
+          mode = 1
+        end if
+        if ( mode == 1 ) then
+          if ( t_ == m%time(1) ) then
+            mode = 2
+          else
+            do i = 2, n
+              if ( t_ > m%time(i-1) .and. t_ <= m%time(i) ) then
+                gi(g) = i
+                exit
+              end if
+            end do
+            if ( gi(g) == 0 ) error stop 'Q2D (667): the time falls outside the table of the file'
+          end if
+        end if
+        gmode(g) = mode
+        gt(g) = t_
+      end associate
+    end do
+
+    ! the operands of the slots whose group changed bracket (the nozzle 410 files: samples 123 ns apart, multirate stages
+    ! ~0.1 ns: one gather every ~1000 calls), then the interpolation on the dense copies -- the expression of MOSE_open on
+    ! the same operands
+    if ( .not. allocated(q2d_va) ) then
+      allocate ( q2d_va(nprim,q2d_n), q2d_vb(nprim,q2d_n), q2d_ta(nprim,q2d_n), q2d_tb(nprim,q2d_n), &
+                 q2d_gi_c(q2d_ng), q2d_gm_c(q2d_ng) )
+      q2d_va = 0d0; q2d_vb = 0d0; q2d_ta = 0d0; q2d_tb = 1d0; q2d_gi_c = -1; q2d_gm_c = -1
+    end if
+    do k = 1, q2d_n
+      js = q2d_js(k)
+      g  = q2d_grp(k)
+      if ( gi(g) == q2d_gi_c(g) .and. gmode(g) == q2d_gm_c(g) ) cycle
+      do s = 1, nprim
+        if ( q2d_has(s,k) == 0 ) cycle
+        associate ( m => domain%bc(js)%q2d_map(s) )
+          select case ( gmode(g) )
+            case (1)
+              i = gi(g)
+              q2d_va(s,k) = m%var(i-1); q2d_vb(s,k) = m%var(i); q2d_ta(s,k) = m%time(i-1); q2d_tb(s,k) = m%time(i)
+            case (2)
+              q2d_va(s,k) = m%var(1)
+            case (3)
+              q2d_va(s,k) = m%var(m%n)
+          end select
+        end associate
+      end do
+    end do
+    q2d_gi_c = gi; q2d_gm_c = gmode
+    do k = 1, q2d_n
+      g  = q2d_grp(k)
+      do s = 1, nprim
+        if ( q2d_has(s,k) == 0 ) cycle
+        if ( gmode(g) == 1 ) then
+          q2d_val(s,k) = (q2d_vb(s,k)-q2d_va(s,k))/(q2d_tb(s,k)-q2d_ta(s,k))*(gt(g)-q2d_ta(s,k))+q2d_va(s,k)
+        else
+          q2d_val(s,k) = q2d_va(s,k)
+        end if
+      end do
+    end do
+    deallocate ( gi, gmode, gt )
+    !$acc update device(q2d_val)
+
+  end subroutine Q2D_Ghost_Values
+
+
+  !> One slot per local record of type 667, in the order of the device boundary arrays (bc_perm): its index there, its
+  !> block and the dimensions of the block, the variables that its file gives, and its group (file and periodic flag).
+  subroutine Q2D_Setup_Slots ( domain )
+    use MOSE_Mod_MPI, only: is_local_block
+    implicit none
+    type(MOSE_domain_type), intent(inout) :: domain
+    ! Local
+    integer :: i, js, k, g, s, b, nmax
+    character(len=256), allocatable :: gfile(:)
+    logical, allocatable :: gper(:)
+
+    q2d_n = 0
+    do i = 1, domain%nbound
+      if ( domain%bc(i)%type == 667 .and. is_local_block ( domain%bc(i)%b ) ) q2d_n = q2d_n + 1
+    end do
+    if ( q2d_n == 0 ) return
+    ! never a run with faces of type 667 and no ghost for them
+    if ( .not. allocated ( domain%bc_perm ) ) error stop 'Q2D (667): the device boundary arrays are not built yet'
+
+    nmax = q2d_n
+    allocate ( q2d_idx(nmax), q2d_blk(nmax), q2d_js(nmax), q2d_grp(nmax), q2d_has(nprim,nmax), q2d_dim(3,nmax), &
+               q2d_val(nprim,nmax), q2d_ref(nmax), gfile(nmax), gper(nmax) )
+    q2d_has = 0
+    q2d_val = 0d0
+    q2d_ng  = 0
+    k = 0
+    do i = 1, domain%nbound
+      js = domain%bc_perm(i)
+      if ( domain%bc(js)%type /= 667 ) cycle
+      if ( .not. is_local_block ( domain%bc(js)%b ) ) cycle
+      k = k + 1
+      b = domain%bc(js)%b
+      q2d_idx(k)   = i
+      q2d_blk(k)   = b
+      q2d_js(k)    = js
+      q2d_dim(:,k) = domain%blk(b)%dim
+      do s = 1, nprim
+        if ( domain%bc(js)%q2d_map(s)%exists ) q2d_has(s,k) = 1
+      end do
+      do g = 1, q2d_ng
+        if ( trim(gfile(g)) == trim(domain%bc(js)%q2d_file) .and. ( gper(g) .eqv. domain%bc(js)%q2d_periodic ) ) exit
+      end do
+      if ( g > q2d_ng ) then
+        q2d_ng = q2d_ng + 1
+        g = q2d_ng
+        gfile(g) = domain%bc(js)%q2d_file
+        gper(g)  = domain%bc(js)%q2d_periodic
+        q2d_ref(g) = js
+      end if
+      q2d_grp(k) = g
+    end do
+    deallocate ( gfile, gper )
+    write(*,'(A,I0,A,I0,A)') ' [BC] 667 (MOSE_open 410) on the device: ', q2d_n, ' faces, ', q2d_ng, ' table(s)'
+    allocate ( q2d_all(q2d_n) )
+    do k = 1, q2d_n
+      q2d_all(k) = k
+    end do
+    !$acc enter data copyin(q2d_idx, q2d_blk, q2d_has, q2d_dim, q2d_val, q2d_all)
+
+  end subroutine Q2D_Setup_Slots
 
 
 end module MOSE_Mod_BC_Q2D

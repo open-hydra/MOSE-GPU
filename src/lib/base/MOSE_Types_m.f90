@@ -184,6 +184,7 @@ module MOSE_Types_m
     real(R8)        :: vnn              ! Parametro di stabilita' diffusiva
     integer         :: rampa_iter       ! Numero di iterazioni per rampa di vnn
     logical         :: time_accurate    ! Flag per integrazione time-accurate
+    logical         :: dt_additive = .false. ! dt-rule = additive: the time step of MOSE_open main (rates added, SST stiffness)
     logical         :: time_clip = .false. ! Clip the last dt so the run lands exactly on time-threshold
     logical         :: dump_clip = .false. ! dump-clip: clip dt so the run lands exactly on every time-based output instant (A5, 16/09)
     real(R8)        :: dump_dt   = huge(1.0_R8) ! sol-dtime copied at setup (the output period used by dump-clip)
@@ -232,6 +233,7 @@ module MOSE_Types_m
       class(config_type) :: self
       ! Local
       integer :: error
+      character(llen) :: dt_rule_
 
       ! Newrun/restart
       call fini%get(section_name=trim(codename)//'-parameters', option_name='newrun', val=self%newrun, error=error)
@@ -274,6 +276,17 @@ module MOSE_Types_m
       ! Time-accurate switch
       self%time_accurate = .false.
       call fini%get(section_name=trim(codename)//'-parameters', option_name='time-accurate', val=self%time_accurate, error=error)
+
+      ! dt-rule: min (default, the previous rule: the smallest of the CFL and VNN limits of the directions) or additive
+      ! (MOSE_open main Mod_dt: the rates of the directions and of convection and diffusion add up, and with explicit SST
+      ! sources the bound of their stiffness enters the step)
+      dt_rule_ = 'min'
+      call fini%get(section_name=trim(codename)//'-parameters', option_name='dt-rule', val=dt_rule_, error=error)
+      select case (trim(dt_rule_))
+      case ('min');      self%dt_additive = .false.
+      case ('additive'); self%dt_additive = .true.
+      case default;      error stop ( '  ['//trim(codename)//'-parameters] dt-rule: min or additive' )
+      end select
 
       ! time-clip: land exactly on time-threshold (last dt clipped). Default off so that
       ! existing references/oracles (never clipped) stay comparable step for step.

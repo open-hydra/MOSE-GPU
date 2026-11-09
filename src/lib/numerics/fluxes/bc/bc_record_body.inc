@@ -50,6 +50,12 @@
           beta_  = beta(Im,Jm,Km)
           Mrec_  = m_f(:,:,Im,Jm,Km);  ynrec_ = yn(Im,Jm,Km)
           Mgho_  = m_f(:,:,Ig_,Jg_,Kg_); yngho_ = yn(Ig_,Jg_,Kg_)
+        else if ( bc_typ(idx) == 667 ) then
+          ! MOSE_open 410: the connection twins on the ghost of the file. The wall distance of the ghost is that of the cell:
+          ! the ghost yn is written behind the 101 faces only (MOSE_open Yn_Chimera takes the same for the 102)
+          beta_  = beta(Im,Jm,Km)
+          Mrec_  = m_f(:,:,Im,Jm,Km);  ynrec_ = yn(Im,Jm,Km)
+          Mgho_  = m_f(:,:,Ig_,Jg_,Kg_); yngho_ = ynrec_
         else if ( bc_typ(idx) == 3 .or. bc_typ(idx) == 5 .or. bc_typ(idx) == 6 ) then
           Mrec_  = m_f(:,:,Im,Jm,Km);  ynrec_ = yn(Im,Jm,Km)
         end if

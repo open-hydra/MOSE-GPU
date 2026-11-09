@@ -25,6 +25,7 @@ contains
     use MOSE_Lib_Interpolation
     use MOSE_Lib_RotatingFrame, only: RF_Torque_Walls
     use MOSE_Mod_MPI, only: mpi_is_root
+    use MOSE_Lib_Multirate_Base, only: obj_mr, mr_output_landed
 
     implicit none
     type(MOSE_simulation_type), intent(inout) :: simulation
@@ -33,9 +34,11 @@ contains
     character(llen) :: solfile, bckfile, dgsfile, wallfile, mgfile
     integer         :: m, level
     logical         :: skip_bck_
+    logical         :: mr_land_on_   ! mr-land: the time-based output of the multirate follows mr_output_landed
     
     level = simulation%config%MG_level
     skip_bck_ = .false.
+    mr_land_on_ = obj_mr%drive .and. obj_mr%land .and. simulation%config%time_accurate
 
     ! Update IOfield solutiontime
     if (simulation%config%time_accurate) then
@@ -105,6 +108,7 @@ contains
       end block
       ! Write output solution
       if ( .not. skip_bck_ ) call Write_Bck ( simulation%domain(1), simulation%IOfield(1), bckfile )
+      if ( .not. skip_bck_ ) call Write_Restart_State ( simulation, 1, bckfile )
       call Write_Solution ( simulation%domain(1), simulation%IOfield(1), solfile )
       if (WALL) call Write_Wall_Solution( simulation%domain(1), wallfile, obj_io%sol_format )
       if (.not. simulation%config%time_accurate) call Write_Diagnostic ( simulation%domain(1), simulation%IOfield(1), dgsfile, obj_io%sol_format )
@@ -180,8 +184,13 @@ contains
         endif
 
       ! Time-based solution
-      elseif ( simulation%domain(level) % time >= simulation%config % time_from_call + obj_io%sol_dtime ) then
-        if ( obj_io%sol_dtime_grid ) then   ! sol-dtime-grid: next threshold on the fixed grid, the offset does not accumulate
+      ! (mr-land: with the multirate the macro step that landed on t_k = k sol-dtime; the sum time_from_call + sol-dtime can
+      ! round above t_k)
+      elseif ( ( mr_land_on_ .and. mr_output_landed ) .or. ( .not. mr_land_on_ .and. &
+               simulation%domain(level) % time >= simulation%config % time_from_call + obj_io%sol_dtime ) ) then
+        if ( mr_land_on_ ) then
+          simulation%config % time_from_call = simulation%domain(level) % time
+        else if ( obj_io%sol_dtime_grid ) then   ! sol-dtime-grid: next threshold on the fixed grid, the offset does not accumulate
           simulation%config % time_from_call = simulation%config % time_from_call + obj_io%sol_dtime * &
             real( floor( ( simulation%domain(level) % time - simulation%config % time_from_call ) / obj_io%sol_dtime ), 8 )
         else
@@ -211,6 +220,7 @@ contains
       if ( mod(simulation%domain(level) % iter, obj_io%bck_diter) == 0d0 ) then
         if (mpi_is_root) write(*,*) ' ... writing iter-based backup'
         call Write_Bck ( simulation%domain(level), simulation%IOfield(level), bckfile )
+        if ( level == 1 ) call Write_Restart_State ( simulation, level, bckfile )
         if (simulation%config%MGL > 1 .and. level > 1) then
           if (mpi_is_root) write(*,*) ' ... writing prolongated solution to grid-level 1'
           do m = simulation%config%MG_level, 2, -1
@@ -317,6 +327,34 @@ contains
     if ( mpi_is_root ) write(*,'(A,A,A,I0,A,I0,A,I0,A,I0)') ' [HASH] state w interior ', trim(tag), ' ', iter, ': n ', gn_, ' lo ', g1_, ' hi ', g2_
     if ( tag == 'end' ) write(*,'(A,I0,A,I0,A,I0,A,I0)') ' [HASH] rank ', mpi_rank_, ' n ', n_, ' lo ', h1_, ' hi ', h2_
   end subroutine hash_print_
+
+
+  !> mr-restart (open-hydra MOSE feature/multirate-integrator F2, by persisting the state): next to a native (lossless)
+  !> backup OUTPUT/<file>.bin, OUTPUT/<file>_state_r<rank>.bin with the counters of the run (time, iter, iter_general, the
+  !> time-based dumps taken, time_from_call, the number of the output files id_stampa: version 2) and the multirate
+  !> partition of the step (MR_Write_State). A restart from that
+  !> backup (rst-format native) reads it back (Wrap_Setup Read_Restart_State) and goes on as the uninterrupted run.
+  subroutine Write_Restart_State ( simulation, level, file )
+    use MOSE_Types_m
+    use MOSE_IO_Solution, only: obj_io
+    use MOSE_Mod_MPI, only: mpi_rank_
+    use MOSE_Mod_Multirate_Partition, only: MR_Write_State
+    implicit none
+    type(MOSE_simulation_type), intent(in) :: simulation
+    integer,      intent(in) :: level
+    character(*), intent(in) :: file
+    integer :: u
+    character(len=16) :: rk_
+    if ( trim(obj_io%bck_format(1)) /= 'native' ) return
+    write(rk_,'(I0)') mpi_rank_
+    open ( newunit=u, file='OUTPUT/'//trim(file)//'_state_r'//trim(rk_)//'.bin', form='unformatted', access='stream', &
+           status='replace', convert='big_endian' )
+    write(u) 2
+    write(u) simulation%domain(level)%time, simulation%domain(level)%iter, simulation%config%iter_general, &
+             obj_io%n_tdump, simulation%config%time_from_call, id_stampa
+    call MR_Write_State ( simulation%domain(level), u )
+    close(u)
+  end subroutine Write_Restart_State
 
 
 end module MOSE_Wrap_Postprocess

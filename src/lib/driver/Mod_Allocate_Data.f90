@@ -72,7 +72,7 @@ contains
     end if
     do b = 1, nblocks
       if (mpi_is_root) &
-        write(*,'(A9,I2,A3,3I5,A8,I3)') ' - Block ', b, ' = ', domain%blk(b)%dim, '  rank =', block_owner(b)
+        write(*,'(A9,I3,A3,3I5)') ' - Block ', b, ' = ', domain%blk(b)%dim   ! the rank follows in Setup_BC (final map)
 
       ! Allocate domain block (all blocks on all ranks for ghost cell connectivity)
       call Allocate_Block ( domain%blk(b), domain%blk(b)%dim, MGL )

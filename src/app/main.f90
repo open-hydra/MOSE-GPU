@@ -5,6 +5,7 @@ program MOSE_program
   use MOSE_Procedures_m
   use MOSE_Types_m
   use MOSE_Mod_MPI
+  use MOSE_Lib_Multirate_Base, only: obj_mr
 #ifdef USE_MPI
   use MOSE_Mod_GhostExchange, only: cleanup_ghost_schedule
 #endif
@@ -73,6 +74,23 @@ program MOSE_program
   ! ranks is the imbalance share, halo-wait is the true comm-wait share.
   if (mpi_size_ > 1) write(*,'(A,I4,A,F12.3,A,F12.3,A)') &
     ' [TIMING] rank ', mpi_rank_, ' solve = ', t_solve, ' s  halo-wait = ', halo_wait_time, ' s'
+  ! The halo exchange split by phase (Mod_MPI halo_t): post recv P, pack P + post send, local fills, Pg (post recv, pack,
+  ! post send), wait recv P, unpack P + chimera + bc_pg normal, wait recv Pg, unpack Pg + wait sends.
+  if (mpi_size_ > 1) write(*,'(A,I4,A,8F9.3)') &
+    ' [TIMING] rank ', mpi_rank_, ' halo phases s (postrecvP packP+send localfill Pg[after unpack] waitP unpackP+gathers waitPg unpackPg+waitsend) =', halo_t
+  ! the stage wall of every rank per level (the root's line is printed by MR_Macro_Step): the load skew of the fine levels
+  if (mpi_size_ > 1 .and. obj_mr%drive) write(*,'(A,I4,A,9F9.2)') &
+    ' [TIMING] rank ', mpi_rank_, ' multirate stage wall s per level L0..L8 =', obj_mr%tlev
+  ! the same phases per multirate level (the stages of the ladder; the rows with no time are the levels not used)
+  if (mpi_size_ > 1) then
+    block
+      integer :: lv
+      do lv = 0, 8
+        if (sum(halo_tl(:, lv)) > 0d0) write(*,'(A,I4,A,I1,A,8F9.3)') &
+          ' [TIMING] rank ', mpi_rank_, ' halo phases L', lv, ' s =', halo_tl(:, lv)
+      end do
+    end block
+  end if
 #endif
 
   ! Free persistent MPI requests before finalizing

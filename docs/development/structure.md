@@ -33,7 +33,10 @@ boundary fluxes, the state update, chemistry once per step; read this to underst
 `explicit/Lib_Newstate.f90` (`Newstate_Conservative` / `Newstate_Primitive` and their per-block kernels, the state
 check), `explicit/Lib_IRS.f90` (residual smoothing: `IRS_apply` on the device residual), `explicit/Lib_Preconditioning.f90`
 (integration-variables = prec: the reference velocity Ur of the cells, `Update_Derived_Variables`), `explicit/Lib_RK.f90`,
-`explicit/Lib_Strang.f90`.
+`explicit/Lib_Strang.f90`; `multirate/` (the multirate integrator, [Multirate](../user/multirate.md)):
+`Lib_Multirate_Base.f90` (keys, shared state, the restart state), `Mod_Multirate_Partition.f90` (the levels, the rules, the
+cap, boxes and lists of every level, the certificate scratch), `Mod_Multirate.f90` (the macro step: the recursion of the
+levels, the halo interpolated in time, the flux telescoping, the redo loop).
 
 **numerics/fluxes/** — `Mod_Fluxes.f90` (the flux driver: `Fluxes` → `Fluxes_blk` per block, the fused pass 2 that
 accumulates the face fluxes into `R_flat`), `Mod_Convective.f90` (the CUDA-Fortran convective kernels, one per
@@ -66,7 +69,7 @@ omega source, `omega-source-relax`).
 `Mod_GhostExchange.f90` (the inter-rank halo on the device: pack / unpack kernels, persistent requests, the
 transverse ghost layers `Pg`).
 
-**io/** — `IO_Ini.f90` (the GPU input dialect; `Stop_On_Removed_Keys`: multirate, j-implicit and the other
+**io/** — `IO_Ini.f90` (the GPU input dialect; `Stop_On_Removed_Keys`: j-implicit, IMEX and the other
 features this version does not have stop the run), `IO_Ini_Open.f90` (the MOSE input dialect, translated
 key by key), `IO_BC.f90` / `IO_BC_Open.f90` (the two bc.txt dialects), `IO_Chemistry.f90`, `IO_RANS.f90`,
 `IO_Solution.f90` (ascii and szplt fields), `IO_ThermoTransport.f90`, `IO_Wall.f90`, `Mod_Probes.f90`.

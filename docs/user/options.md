@@ -55,6 +55,7 @@ The boundary types are listed in [Boundary Conditions](boundary-conditions.md). 
 |---|---|
 | `sol-format` | as in MOSE: `tecplot ascii`, `tecplot binary` (szplt), `vtk ascii`, `vtk raw` |
 | `sol-diter`, `shell-diter`, `ini-diter` | as in MOSE |
+| `bck-format`, `rst-format` | the format of the backup field, and the one a restart reads it in (default: `bck-format`); `native binary` is lossless and writes the run state next to it: the restart goes on as the uninterrupted run ([Multirate](multirate.md#restart)) |
 | probes | as in MOSE: `[MOSE-Probes]` and one section per probe with `index-position` or `position` |
 
 !!! warning "Probe position key"

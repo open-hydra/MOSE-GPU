@@ -1,4 +1,5 @@
 module MOSE_Lib_Newstate
+  use MOSE_Lib_Multirate_Base, only: mr_q   ! expl-async: the stage queue of the block kernels
   ! ieee_is_nan instead of the non-standard isnan() extension (nvfortran has no isnan)
   use, intrinsic :: ieee_arithmetic
   use iso_fortran_env, only: R8 => real64
@@ -81,13 +82,15 @@ contains
     use MOSE_Lib_IRS
     use MOSE_Mod_MPI, only: is_local_block
     use MOSE_Lib_IRS, only: IRS_apply
+    use MOSE_Lib_Multirate_Base, only: mr_block_active, mr_nbox, mr_get_box, mr_dt_sel, mr_check_now, mr_list_on, mrcl, obj_mr
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
     integer, intent(in)                   :: irk
     ! Local
-    integer :: b
+    integer :: b, ib, lo(3), hi(3)
     integer :: nbad_, ib_, jb_, kb_
+    real(R8) :: hsel
 
     !> The state update on the resident P_flat, one kernel per local block (Mod_Newstate_W); IRS on the device too.
     ! IRS on the device (MOSE_open Newstate_Conservative, IRS branch): the resident P_flatr is scaled by
@@ -97,19 +100,42 @@ contains
       call IRS_apply ( domain, obj_irs%beta, obj_irs%njacobi, strangcoeff )
       !$omp end single
     end if
+    ! Multirate stage: the boxes of the stage's level, and in them only the cells whose sub-step dtlocal is the level's
+    ! (hsel; -1 updates every cell)
+    hsel = mr_dt_sel()
     !$omp single
+    ! a list level of a multirate stage (mr-list-level): one launch over the level's cells of every local block
+    if ( mr_list_on() ) then
+      if ( mrcl(obj_mr%lcur)%n > 0 ) &
+        call Newstate_Conservative_list ( mrcl(obj_mr%lcur)%c, mrcl(obj_mr%lcur)%vol, mrcl(obj_mr%lcur)%n, hsel, &
+                                          strangcoeff, rk_coeff(irk), prescaled = obj_irs%IRS )
+    else
     do b = 1, domain % nb
       if ( .not. ( is_local_block(b) ) ) cycle
+      if ( .not. mr_block_active(b) ) cycle
+      do ib = 1, mr_nbox(b)
+        call mr_get_box ( b, ib, domain%blk(b)%dim, lo, hi )
         call Newstate_Conservative_blk ( b, domain%blk(b)%dtlocal,      &
                domain%blk(b)%vol, domain%blk(b)%T_c,                        &
-               domain%blk(b)%dim, strangcoeff, rk_coeff(irk), prescaled = obj_irs%IRS )
+               domain%blk(b)%dim, strangcoeff, rk_coeff(irk), lo, hi, hsel, prescaled = obj_irs%IRS )
+      end do
     end do
-    if ( state_check ) then   ! the state check of MOSE_open (state-check key): a separate launch
+    end if
+    ! the state check of MOSE_open (state-check key): a separate launch. In a multirate step once, after the last stage of
+    ! level 0 (every level at the end of the macro step), on the whole block: a reduction per box and stage cost a host
+    ! read each, and a bad cell stops the run at most one macro step later
+    if ( ( state_check .or. obj_mr%nonlocal == 2 ) .and. mr_check_now() ) then
       !$acc wait
       do b = 1, domain % nb
         if ( .not. is_local_block(b) ) cycle
-        call State_Check_blk ( b, domain%blk(b)%dim, nbad_, ib_, jb_, kb_ )
-        if ( nbad_ > 0 ) call State_Check_report ( b, ib_, jb_, kb_, nbad_ )
+        call State_Check_blk ( b, domain%blk(b)%dim, nbad_, ib_, jb_, kb_, (/1,1,1/), domain%blk(b)%dim )
+        if ( nbad_ > 0 ) then
+          if ( obj_mr%nonlocal == 2 ) then   ! mr-nonlocal = redo: the attempt is rejected and redone with H/2
+            obj_mr%nonphys = .true.
+          else
+            call State_Check_report ( b, ib_, jb_, kb_, nbad_ )
+          end if
+        end if
       end do
     end if
     !$omp end single
@@ -151,7 +177,7 @@ contains
       !$acc wait
       do b = 1, domain % nb
         if ( .not. is_local_block(b) ) cycle
-        call State_Check_blk ( b, domain%blk(b)%dim, nbad_, ib_, jb_, kb_ )
+        call State_Check_blk ( b, domain%blk(b)%dim, nbad_, ib_, jb_, kb_, (/1,1,1/), domain%blk(b)%dim )
         if ( nbad_ > 0 ) call State_Check_report ( b, ib_, jb_, kb_, nbad_ )
       end do
     end if
@@ -171,18 +197,20 @@ contains
   !> the first one in memory order; a separate launch, the update kernels are untouched. NaN is caught by ordered
   !> comparisons (false for NaN), not by x /= x, which fast math may fold away. The species floor 1e-20 of the MOSE_open
   !> routine is already in the update (newstate_cons_body.inc).
-  subroutine State_Check_blk ( b, n, nbad, ibad, jbad, kbad )
+  subroutine State_Check_blk ( b, n, nbad, ibad, jbad, kbad, lo, hi )
     integer, intent(in)  :: b, n(3)
     integer, intent(out) :: nbad, ibad, jbad, kbad
-    integer :: i, j, k, s, c0, cmin, boff, pi, pj, n1, n2, n3
+    integer, intent(in)  :: lo(3), hi(3)   ! the cells checked: the whole block, or a box of a multirate stage
+    integer :: i, j, k, s, c0, cmin, boff, pi, pj, n1, n2, n3, lo1, hi1, lo2, hi2, lo3, hi3
     logical :: bad
     call field_block_index_params(b, boff, pi, pj)
     n1 = n(1); n2 = n(2); n3 = n(3)
+    lo1 = lo(1); hi1 = hi(1); lo2 = lo(2); hi2 = hi(2); lo3 = lo(3); hi3 = hi(3)
     nbad = 0; cmin = huge(1)
     !$acc parallel loop collapse(3) gang vector present(P_flat) reduction(+:nbad) reduction(min:cmin) private(c0, s, bad)
-    do k = 1, n3
-    do j = 1, n2
-    do i = 1, n1
+    do k = lo3, hi3
+    do j = lo2, hi2
+    do i = lo1, hi1
       c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
       bad = .not. ( P_flat(c0,np) >= 0.0_R8 )
       do s = 1, nprim
@@ -226,11 +254,13 @@ contains
   !>   n        : block interior dims (ni,nj,nk).
   !>   strang   : Strang operator-splitting coefficient.
   !>   rkc      : RK-stage coefficient rk_coeff(irk).
-  subroutine Newstate_Conservative_blk ( b, dtlocal, vol, T_c, n, strang, rkc, prescaled )
+  subroutine Newstate_Conservative_blk ( b, dtlocal, vol, T_c, n, strang, rkc, lo, hi, hsel, prescaled )
     use FLINT_Lib_Thermodynamic, only: h_tab, cp_tab, Ri_tab, f_Rtot, Tmin, Tmax
     integer,  intent(in) :: b
     integer,  intent(in) :: n(3)
     real(R8), intent(in) :: strang, rkc
+    integer,  intent(in) :: lo(3), hi(3)   ! the cells: the whole block, or a box of a multirate stage
+    real(R8), intent(in) :: hsel           ! > 0: update only the cells with dtlocal == hsel (a multirate level); else all
     real(R8), dimension(1:n(1), 1:n(2), 1:n(3)), intent(in) :: dtlocal
     logical,  intent(in), optional :: prescaled   ! IRS: R_flat already holds -dt/vol*strang*R smoothed
     real(R8), dimension(1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(in) :: vol, T_c
@@ -247,8 +277,10 @@ contains
     real(R8) :: consold(nprim), cons(nprim), res_l(nprim)
     ! Dims as scalars -- a dummy array referenced inside the
     ! acc region is implicitly copied per launch; scalars ride the launch parameters.
-    integer :: nb1_, nb2_, nb3_
+    integer :: nb1_, nb2_, nb3_, lo1_, hi1_, lo2_, hi2_, lo3_, hi3_
+    real(R8) :: hsel_
     nb1_ = n(1); nb2_ = n(2); nb3_ = n(3)
+    lo1_ = lo(1); hi1_ = hi(1); lo2_ = lo(2); hi2_ = hi(2); lo3_ = lo(3); hi3_ = hi(3); hsel_ = hsel
     ! The resident var-LAST R_flat is the SOLE residual input. Device
     ! writers (conv/diff pass-2, BC, SST) accumulate into it directly; host bridge
     ! sources (RotatingFrame/soot) are folded in by field_add_R_to_R_flat BEFORE this
@@ -258,11 +290,14 @@ contains
     ps_ = .false.; if (present(prescaled)) ps_ = prescaled
     tmin_ = Tmin; tmax_ = Tmax
     !$acc data copyin(dtlocal, vol, T_c)
-    !$acc parallel loop collapse(3) gang vector present(P_flat, PO_flat, R_flat, dtlocal, vol, T_c) &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) present(P_flat, PO_flat, R_flat, dtlocal, vol, T_c) &
     !$acc&  private(p_l, po_l, consold, cons, res_l, c0, T_i, it, s, dt_l, vol_l, tc_l)
-    do k = 1, n(3)
-    do j = 1, n(2)
-    do i = 1, n(1)
+    do k = lo3_, hi3_
+    do j = lo2_, hi2_
+    do i = lo1_, hi1_
+      if ( hsel_ > 0.0_R8 ) then
+        if ( dtlocal(i,j,k) /= hsel_ ) cycle
+      end if
       c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
       dt_l = dtlocal(i,j,k); vol_l = vol(i,j,k); tc_l = T_c(i,j,k)
 #include "newstate_cons_body.inc"
@@ -270,6 +305,36 @@ contains
     !$acc end data
 
   end subroutine Newstate_Conservative_blk
+
+  !> The conservative Newstate on the cell list of a multirate level (list path): the body of Newstate_Conservative_blk
+  !> (newstate_cons_body.inc) per listed cell, dt = the level's sub-step (the dtlocal of every cell of the level), the
+  !> volume gathered by the list, the T seed from the flat thermo twin T_c_f (the same doubles as the block cache T_c).
+  subroutine Newstate_Conservative_list ( cl, vl, ne, dtlev, strang, rkc, prescaled )
+    use FLINT_Lib_Thermodynamic, only: h_tab, cp_tab, Ri_tab, f_Rtot, Tmin, Tmax
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use MOSE_Field_m, only: T_c_f
+    integer,  intent(in) :: ne, cl(ne)
+    real(R8), intent(in) :: vl(ne), dtlev, strang, rkc
+    logical,  intent(in), optional :: prescaled
+    integer  :: e, s, T_i, it, c0
+    real(R8) :: rho, Rg, vmag, Tloc, Td, hmix, E0, dt
+    real(R8) :: energy, p_it, cv, enth, diff_en, T_it, h_s, cp_s
+    real(R8) :: dt_l, vol_l, tc_l
+    logical  :: ps_
+    integer  :: tmin_, tmax_
+    real(R8) :: p_l(nprim), po_l(nprim)
+    real(R8) :: consold(nprim), cons(nprim), res_l(nprim)
+    real(R8) :: dtlev_
+    ps_ = .false.; if (present(prescaled)) ps_ = prescaled
+    tmin_ = Tmin; tmax_ = Tmax; dtlev_ = dtlev
+    !$acc parallel loop gang vector async(mr_q) present(P_flat, PO_flat, R_flat, T_c_f, cl, vl) &
+    !$acc&  private(p_l, po_l, consold, cons, res_l, c0, T_i, it, s, dt_l, vol_l, tc_l)
+    do e = 1, ne
+      c0 = cl(e)
+      dt_l = dtlev_; vol_l = vl(e); tc_l = T_c_f(c0)
+#include "newstate_cons_body.inc"
+    end do
+  end subroutine Newstate_Conservative_list
 
 
 

@@ -35,6 +35,9 @@ module MOSE_IO_BC_Open
   !> outward the face falls back to a reflective (symmetry) boundary, which is
   !> exactly what every MOSE_open BC_Inlet_* routine does (error = 1).
   real(R8), parameter :: PAMB_FORCE_INFLOW = -3.14d0
+  !> The same for 405, which BC_Inflow_Outflow also sends to the supersonic closure at any Mach (MOSE_open
+  !> BC_Inlet_Supersonic_Static); the legacy dispatch reaches it for Mach > 1 only.
+  real(R8), parameter :: PAMB_FORCE_SUPERSONIC = -2.71d0
 
   !> Legacy mach-column encodings of the inflow modes (see BC_Subsonic_Inflow):
   !>   >= 0  : stagnation (p0, T0) inlet   -- open 401/402/407
@@ -290,14 +293,10 @@ contains
           bc%mach, bc%T0, bc%p0, alpha_tok, beta_tok, bc%rel_fac, &
           (bc%ci(s), s = nrans+1, nrans+nsc), (bc%ci(s), s = 1, nrans)
         call Set_Inflow_Direction ( bc, alpha_tok, beta_tok, open_type )
-        if (bc%mach <= 1.0d0) then
-          write(*,*) '  [ERROR] BC 405 (supersonic inlet) with Mach = ', bc%mach
-          write(*,*) '          The legacy inflow dispatch only reaches the supersonic closure'
-          write(*,*) '          for Mach > 1; a subsonic Mach would silently switch to the'
-          write(*,*) '          stagnation closure and reinterpret p as a total pressure.'
-          error stop 'IO_BC (MOSE_open dialect): BC 405 requires Mach > 1'
-        endif
-        bc%pamb = PAMB_FORCE_INFLOW
+        ! Any Mach, as MOSE_open (BC_Inlet_Supersonic_Static: the state of Mach, T, p in the ghost and the Riemann flux,
+        ! subsonic Machs included): the marker sends the record to the supersonic closure whatever its Mach, and closes
+        ! the face on outward flow as PAMB_FORCE_INFLOW
+        bc%pamb = PAMB_FORCE_SUPERSONIC
         bc % type = 4
 
       ! ── 407: ambient / far field, T0 + p0 (inflow) or back pressure (outflow)

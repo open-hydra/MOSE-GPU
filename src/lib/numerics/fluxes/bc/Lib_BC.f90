@@ -16,6 +16,16 @@ module MOSE_Lib_BC
 #  define PCELL(s,i,j,k) w( boff + ((i)+gc-1) + ((j)+gc-1)*pi + ((k)+gc-1)*pi*pj + 1, s )
 #  define WRCELL(s,i,j,k) wr( wroff + ((i)+gc-1) + ((j)+gc-1)*pi + ((k)+gc-1)*pi*pj + 1, s )
 
+  !> mr-conn-fast (MOSE_CONN_FAST = 0 / 1 / 2, default 2; set once by Mod_BC Setup_BC_Device): the connection records by
+  !>   0  BC_Connection_Eul + BC_Connection_Visc (as before);
+  !>   1  BC_Connection_Eul + BC_Connection_Visc_fast: the face state of the two Compute_Diffusive_Flux calls once, only the
+  !>      four cell neighbours the face direction uses;
+  !>   2  BC_Connection_Eul_lean + BC_Connection_Visc_lean: as 1, and the cell values read where they are used instead of
+  !>      held in per-cell arrays (the stack and the spills of the seq routines are what makes a record slow).
+  !> The same operations on the same values in all three: the field must not change.
+  integer, public :: conn_fast_dev = 2
+  !$acc declare create(conn_fast_dev)
+
 contains
 
 
@@ -1561,7 +1571,7 @@ contains
     if (BC_Mach < 0d0) InOut = -1d0
 
     if (InOut >= 0d0) then
-      if (BC_pAmb == -3.14d0) then
+      if (BC_pAmb == -3.14d0 .or. BC_pAmb == -2.71d0) then   ! inlet markers of IO_BC_Open (-2.71: 405)
         error = 1
         return
       else
@@ -1569,7 +1579,7 @@ contains
                               Riem, Normal, Area, BC_pAmb, BC_rel_fac, BC_Sign, Flux, Fmass )
       end if
     else
-      if (BC_Mach > 1d0) then
+      if (BC_Mach > 1d0 .or. BC_pAmb == -2.71d0) then   ! 405: the supersonic closure at any Mach, as MOSE_open
         call BC_Supersonic_Inflow ( Bound_Prim, Int_Prim, modfm, modfm1, modfm2, BC_Mach, BC_p0, BC_T0, &
                                         BC_ci, BC_RANS, BC_rel_fac, BC_alpha, BC_beta, Normal, Area, Flux, Fmass )
       else if (BC_Mach < 1d0) then
@@ -1755,6 +1765,105 @@ contains
   end subroutine BC_Connection_Eul
 
 
+  !> mr-conn-fast 2: BC_Connection_Eul with the four stencil values read per variable where they are used (no Prim1..4
+  !> arrays). The same expressions in the same order.
+  subroutine BC_Connection_Eul_lean ( PWARG, r, beta_c, dlc4, n1, n2, n3, Im, Jm, Km, Fm, Normal, Area )
+    !$acc routine seq
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_ss_dev
+    use MOSE_Lib_Riemann,              only: Riemann, rs_dev
+    use MOSE_Lib_Shock_Detector,       only: sd_dev, SD_beta
+    use MOSE_Lib_Limiters,             only: SD_space_order, rlimiter, lim_dev
+
+    implicit none
+    integer,  intent(in)    :: n1, n2, n3, Im, Jm, Km, Fm
+    real(R8), intent(in)    :: Normal(3), Area, beta_c
+    integer,  intent(in)    :: ncw, nrw, boff, pi, pj, wroff
+    integer,  intent(in)    :: nur
+    real(R8), intent(in)    :: ur(nur)
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: wr(nrw, nprim)
+    real(R8), intent(in)    :: dlc4(4)
+    real(R8), intent(inout) :: r(nprim, 1-gc:n1+gc, 1-gc:n2+gc, 1-gc:n3+gc)
+    integer  :: dir, modfm, modfm1, modfm2, gstep, s, o1, o2, o3, o4
+    integer  :: i1,j1,k1, i2,j2,k2, i3,j3,k3, i4,j4,k4
+    real(R8) :: Prim_L(NPRIM_DEV), Prim_R(NPRIM_DEV)
+    real(R8) :: Dl1, Dl2, Dl3, Dl4, Dist12, Dist23, Dist34, beta_, d21, d32, d43, q1, q2, q3, q4
+    real(R8) :: rho_L, rho_R, Rtot_L, Rtot_R, a_L, a_R, F_r, F_u, F_v, F_w, F_E, Fmass, su, sel_L, sel_R, urL_, urR_
+
+    dir    = (Fm + 1)/2
+    modfm  = mod(Fm, 2)
+    modfm1 = 1 - modfm
+    modfm2 = 1 - 2*modfm
+    gstep  = 2*modfm - 1
+
+    o1 = modfm*(-gstep*gc) + modfm1*( gstep)
+    o2 = modfm*(-gstep)
+    o3 = modfm1*(-gstep)
+    o4 = modfm1*(-gstep*gc) + modfm*( gstep)
+
+    i1=Im;j1=Jm;k1=Km; i2=Im;j2=Jm;k2=Km; i3=Im;j3=Jm;k3=Km; i4=Im;j4=Jm;k4=Km
+    select case (dir)
+      case (1); i1=Im+o1; i2=Im+o2; i3=Im+o3; i4=Im+o4
+      case (2); j1=Jm+o1; j2=Jm+o2; j3=Jm+o3; j4=Jm+o4
+      case (3); k1=Km+o1; k2=Km+o2; k3=Km+o3; k4=Km+o4
+    end select
+
+    if (sd_dev > 0) then
+      beta_ = SD_beta ( sd_dev, PCELL(np,Im,Jm,Km), PCELL(np,Im-1,Jm,Km), PCELL(np,Im+1,Jm,Km), &
+                            PCELL(np,Im,Jm-1,Km), PCELL(np,Im,Jm+1,Km), PCELL(np,Im,Jm,Km-1), PCELL(np,Im,Jm,Km+1) )
+    else if (SD_space_order) then
+      beta_ = beta_c
+    else
+      beta_ = 1d0
+    end if
+
+    Dl1 = dlc4(1)*0.5d0; Dl2 = dlc4(2)*0.5d0
+    Dl3 = dlc4(3)*0.5d0; Dl4 = dlc4(4)*0.5d0
+    Dist12 = Dl1 + Dl2; Dist23 = Dl2 + Dl3; Dist34 = Dl3 + Dl4
+
+    do s = 1, nprim
+      q1 = PCELL(s,i1,j1,k1); q2 = PCELL(s,i2,j2,k2); q3 = PCELL(s,i3,j3,k3); q4 = PCELL(s,i4,j4,k4)
+      d21 = (q2 - q1) / Dist12
+      d32 = (q3 - q2) / Dist23
+      d43 = (q4 - q3) / Dist34
+      Prim_L(s) = q2 + beta_ * rlimiter ( lim_dev, d32, d21) * Dl2
+      Prim_R(s) = q3 - beta_ * rlimiter ( lim_dev, d43, d32) * Dl3
+    end do
+
+    call co_rotot_Rtot_dev ( Prim_L(1:nsc), rho_L, Rtot_L )
+    a_L = f_ss_dev ( Prim_L(1:nsc), Prim_L(np), rho_L, Rtot_L )
+    call co_rotot_Rtot_dev ( Prim_R(1:nsc), rho_R, Rtot_R )
+    a_R = f_ss_dev ( Prim_R(1:nsc), Prim_R(np), rho_R, Rtot_R )
+
+    urL_ = 0d0; urR_ = 0d0
+    if (rs_dev == 14) then
+      urL_ = URCELL(i2,j2,k2); urR_ = URCELL(i3,j3,k3)
+    end if
+    call Riemann ( rs_dev,  Prim_L(1:nsc), Prim_L(nu), Prim_L(nv), Prim_L(nw), Prim_L(np), a_L, rho_L, &
+                        Prim_R(1:nsc), Prim_R(nu), Prim_R(nv), Prim_R(nw), Prim_R(np), a_R, rho_R, &
+                        beta_, urL_, urR_, Normal(1), Normal(2), Normal(3), F_r, F_u, F_v, F_w, F_E )
+
+    su    = sign ( 0.5d0, F_r )
+    sel_L = 0.5d0 + su
+    sel_R = su - 0.5d0
+    Fmass = F_r * Area
+
+    do s = 1, nsc
+      WRCELL(s,Im,Jm,Km) = WRCELL(s,Im,Jm,Km) + modfm2 * Fmass*( sel_L*Prim_L(s)/rho_L - sel_R*Prim_R(s)/rho_R )
+    end do
+    WRCELL(nu,Im,Jm,Km) = WRCELL(nu,Im,Jm,Km) + modfm2 * F_u*Area
+    WRCELL(nv,Im,Jm,Km) = WRCELL(nv,Im,Jm,Km) + modfm2 * F_v*Area
+    WRCELL(nw,Im,Jm,Km) = WRCELL(nw,Im,Jm,Km) + modfm2 * F_w*Area
+    WRCELL(np,Im,Jm,Km) = WRCELL(np,Im,Jm,Km) + modfm2 * F_E*Area
+    if (nprim > np) then
+      do s = np+1, nprim
+        WRCELL(s,Im,Jm,Km) = WRCELL(s,Im,Jm,Km) + modfm2 * Fmass*( sel_L*Prim_L(s)/rho_L - sel_R*Prim_R(s)/rho_R )
+      end do
+    end if
+
+  end subroutine BC_Connection_Eul_lean
+
+
   !> Device helper: primitive -> "viscous" variables (Y_s, vel, T, RANS/rho).
   !> Mirror of the Visc_Variables contained subroutine in BC_Connection_Visc.
   subroutine Visc_Variables ( Prim, Visc )
@@ -1897,6 +2006,199 @@ contains
     end do
 
   end subroutine BC_Connection_Visc
+
+
+  !> mr-conn-fast: BC_Connection_Visc with the same operations on the same values, less repeated work. The two
+  !> Compute_Diffusive_Flux calls take the same Prim_avg: its thermo and transport (Diffusive_Face_State) are evaluated
+  !> once and the two flux tails (Compute_Diffusive_Flux_St) follow. Of the six receiver neighbours only the four of the
+  !> transverse axes ib, ic are converted (the two along the face normal were converted and never read). The gradient
+  !> components are the expressions of BC_Connection_Visc term by term: axis ia = the face direction, (ib, ic) = (2,3),
+  !> (1,3), (1,2) as the select case there.
+  subroutine BC_Connection_Visc_fast ( PWARG, r, Mrec, Mgho, ynrec, yngho, Pg, n1, n2, n3, Im, Jm, Km, Fm, Normal, Area )
+    !$acc routine seq
+    use MOSE_Mod_Diffusive, only: Diffusive_Face_State, Compute_Diffusive_Flux_St
+
+    implicit none
+    integer,  intent(in)    :: n1, n2, n3, Im, Jm, Km, Fm
+    real(R8), intent(in)    :: Normal(3), Area
+    integer,  intent(in)    :: ncw, nrw, boff, pi, pj, wroff
+    integer,  intent(in)    :: nur
+    real(R8), intent(in)    :: ur(nur)
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: wr(nrw, nprim)
+    real(R8), intent(inout) :: r(nprim, 1-gc:n1+gc, 1-gc:n2+gc, 1-gc:n3+gc)
+    real(R8), intent(in)    :: Mrec(3,3), Mgho(3,3)
+    real(R8), intent(in)    :: ynrec, yngho
+    real(R8), intent(in)    :: Pg(nprim, 6)
+    integer  :: dir, modfm2, s, kk, ia, ib, ic, Tint(2)
+    integer  :: ibm, jbm, kbm, ibp, jbp, kbp, icm, jcm, kcm, icp, jcp, kcp
+    real(R8) :: M(3,3), Waldis, rho_f, Tdiff_f, cp_f, mil_f, kl_f
+    real(R8) :: Prim_loc(NPRIM_DEV), Prim_ghost(NPRIM_DEV), Prim_avg(NPRIM_DEV), tmp(NPRIM_DEV), Dml(NPRIM_DEV)
+    real(R8) :: Visc_loc(NPRIM_DEV), Visc_ghost(NPRIM_DEV)
+    real(R8) :: Visc_bp(NPRIM_DEV), Visc_bm(NPRIM_DEV), Visc_cp(NPRIM_DEV), Visc_cm(NPRIM_DEV)
+    real(R8) :: Visc_g3(NPRIM_DEV), Visc_g4(NPRIM_DEV), Visc_g5(NPRIM_DEV), Visc_g6(NPRIM_DEV)
+    real(R8) :: Gloc(NPRIM_DEV,3), Gghost(NPRIM_DEV,3), G2loc(NPRIM_DEV,3), G2ghost(NPRIM_DEV,3)
+    real(R8) :: Flux_loc(NPRIM_DEV), Flux_ghost(NPRIM_DEV)
+
+    dir    = (Fm + 1)/2
+    modfm2 = 1 - 2*mod(Fm,2)
+    ia = dir
+    ibm = Im; jbm = Jm; kbm = Km; ibp = Im; jbp = Jm; kbp = Km
+    icm = Im; jcm = Jm; kcm = Km; icp = Im; jcp = Jm; kcp = Km
+    select case (dir)
+      case (1); ib = 2; ic = 3; jbm = Jm - 1; jbp = Jm + 1; kcm = Km - 1; kcp = Km + 1
+      case (2); ib = 1; ic = 3; ibm = Im - 1; ibp = Im + 1; kcm = Km - 1; kcp = Km + 1
+      case default; ib = 1; ic = 2; ibm = Im - 1; ibp = Im + 1; jcm = Jm - 1; jcp = Jm + 1
+    end select
+
+    do s = 1, 3
+      M(1,s) = 0.5d0*( Mrec(1,s) + Mgho(1,s) )
+      M(2,s) = 0.5d0*( Mrec(2,s) + Mgho(2,s) )
+      M(3,s) = 0.5d0*( Mrec(3,s) + Mgho(3,s) )
+    end do
+    Waldis = 0.5d0*( ynrec + yngho )
+
+    do s = 1, nprim
+      Prim_loc(s)   = PCELL(s,Im,Jm,Km)
+      Prim_ghost(s) = Pg(s,1)
+    end do
+
+    call Visc_Variables ( Prim_loc,   Visc_loc )
+    call Visc_Variables ( Prim_ghost, Visc_ghost )
+    do s = 1, nprim; tmp(s) = PCELL(s,ibp,jbp,kbp); end do; call Visc_Variables ( tmp, Visc_bp )
+    do s = 1, nprim; tmp(s) = PCELL(s,ibm,jbm,kbm); end do; call Visc_Variables ( tmp, Visc_bm )
+    do s = 1, nprim; tmp(s) = PCELL(s,icp,jcp,kcp); end do; call Visc_Variables ( tmp, Visc_cp )
+    do s = 1, nprim; tmp(s) = PCELL(s,icm,jcm,kcm); end do; call Visc_Variables ( tmp, Visc_cm )
+    do s = 1, nprim; tmp(s) = Pg(s,3); end do; call Visc_Variables ( tmp, Visc_g3 )
+    do s = 1, nprim; tmp(s) = Pg(s,4); end do; call Visc_Variables ( tmp, Visc_g4 )
+    do s = 1, nprim; tmp(s) = Pg(s,5); end do; call Visc_Variables ( tmp, Visc_g5 )
+    do s = 1, nprim; tmp(s) = Pg(s,6); end do; call Visc_Variables ( tmp, Visc_g6 )
+
+    do s = 1, nprim
+      Gloc(s,ia)   = ( Visc_ghost(s) - Visc_loc(s) ) * modfm2
+      Gloc(s,ib)   = ( Visc_bp(s) - Visc_bm(s) ) * 0.5d0
+      Gloc(s,ic)   = ( Visc_cp(s) - Visc_cm(s) ) * 0.5d0
+      Gghost(s,ia) = ( Visc_loc(s) - Visc_ghost(s) ) * (-modfm2)
+      Gghost(s,ib) = ( Visc_g4(s) - Visc_g3(s) ) * 0.5d0
+      Gghost(s,ic) = ( Visc_g6(s) - Visc_g5(s) ) * 0.5d0
+    end do
+
+    ! G = matmul(G, M)  ->  G2(s,kk) = sum_j G(s,j)*M(j,kk)
+    do kk = 1, 3
+      do s = 1, nprim
+        G2loc(s,kk)   = Gloc(s,1)*M(1,kk)   + Gloc(s,2)*M(2,kk)   + Gloc(s,3)*M(3,kk)
+        G2ghost(s,kk) = Gghost(s,1)*M(1,kk) + Gghost(s,2)*M(2,kk) + Gghost(s,3)*M(3,kk)
+      end do
+    end do
+
+    do s = 1, nprim
+      Prim_avg(s) = 0.5d0*( Prim_loc(s) + Prim_ghost(s) )
+    end do
+
+    call Diffusive_Face_State ( Prim_avg, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml )
+    call Compute_Diffusive_Flux_St ( Prim_avg, G2loc,   Area, Normal, Waldis, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml, Flux_loc )
+    call Compute_Diffusive_Flux_St ( Prim_avg, G2ghost, Area, Normal, Waldis, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml, Flux_ghost )
+
+    do s = 1, nprim
+      WRCELL(s,Im,Jm,Km) = WRCELL(s,Im,Jm,Km) - 0.5d0 * modfm2 * ( Flux_loc(s) + Flux_ghost(s) )
+    end do
+
+  end subroutine BC_Connection_Visc_fast
+
+
+  !> mr-conn-fast 2: BC_Connection_Visc_fast with the cell values read where they are used. Per cell only (rho, Rgas) of
+  !> co_rotot_Rtot_dev are held; per variable the viscous value of the ten cells (Visc_Variables: Y = rho_s / rho, the
+  !> velocity, T = p / (rho Rgas), RANS / rho) is formed in place, the three gradient components of each side follow, and
+  !> the metric product G.M at once. The same expressions in the same order as BC_Connection_Visc.
+  subroutine BC_Connection_Visc_lean ( PWARG, r, Mrec, Mgho, ynrec, yngho, Pg, n1, n2, n3, Im, Jm, Km, Fm, Normal, Area )
+    !$acc routine seq
+    use MOSE_Mod_Diffusive, only: Diffusive_Face_State, Compute_Diffusive_Flux_St
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev
+
+    implicit none
+    integer,  intent(in)    :: n1, n2, n3, Im, Jm, Km, Fm
+    real(R8), intent(in)    :: Normal(3), Area
+    integer,  intent(in)    :: ncw, nrw, boff, pi, pj, wroff
+    integer,  intent(in)    :: nur
+    real(R8), intent(in)    :: ur(nur)
+    real(R8), intent(in)    :: w(ncw, nprim)
+    real(R8), intent(inout) :: wr(nrw, nprim)
+    real(R8), intent(inout) :: r(nprim, 1-gc:n1+gc, 1-gc:n2+gc, 1-gc:n3+gc)
+    real(R8), intent(in)    :: Mrec(3,3), Mgho(3,3)
+    real(R8), intent(in)    :: ynrec, yngho
+    real(R8), intent(in)    :: Pg(nprim, 6)
+    integer  :: dir, modfm2, s, kk, ia, ib, ic, Tint(2)
+    integer  :: ibm, jbm, kbm, ibp, jbp, kbp, icm, jcm, kcm, icp, jcp, kcp
+    real(R8) :: M(3,3), Waldis, rho_f, Tdiff_f, cp_f, mil_f, kl_f
+    real(R8) :: Prim_avg(NPRIM_DEV), Dml(NPRIM_DEV), y(NPRIM_DEV)
+    real(R8) :: G2loc(NPRIM_DEV,3), G2ghost(NPRIM_DEV,3), Flux_loc(NPRIM_DEV), Flux_ghost(NPRIM_DEV)
+    real(R8) :: rh(10), rg(10), pv(10), vv(10), gl(3), gg(3)
+
+    dir    = (Fm + 1)/2
+    modfm2 = 1 - 2*mod(Fm,2)
+    ia = dir
+    ibm = Im; jbm = Jm; kbm = Km; ibp = Im; jbp = Jm; kbp = Km
+    icm = Im; jcm = Jm; kcm = Km; icp = Im; jcp = Jm; kcp = Km
+    select case (dir)
+      case (1); ib = 2; ic = 3; jbm = Jm - 1; jbp = Jm + 1; kcm = Km - 1; kcp = Km + 1
+      case (2); ib = 1; ic = 3; ibm = Im - 1; ibp = Im + 1; kcm = Km - 1; kcp = Km + 1
+      case default; ib = 1; ic = 2; ibm = Im - 1; ibp = Im + 1; jcm = Jm - 1; jcp = Jm + 1
+    end select
+
+    do s = 1, 3
+      M(1,s) = 0.5d0*( Mrec(1,s) + Mgho(1,s) )
+      M(2,s) = 0.5d0*( Mrec(2,s) + Mgho(2,s) )
+      M(3,s) = 0.5d0*( Mrec(3,s) + Mgho(3,s) )
+    end do
+    Waldis = 0.5d0*( ynrec + yngho )
+
+    ! (rho, Rgas) of the ten cells, as Visc_Variables: 1 loc, 2 ghost, 3 b+, 4 b-, 5 c+, 6 c-, 7..10 = Pg(:,3..6)
+    do s = 1, nsc; y(s) = PCELL(s,Im,Jm,Km); end do;    call co_rotot_Rtot_dev ( y(1:nsc), rh(1), rg(1) )
+    do s = 1, nsc; y(s) = Pg(s,1); end do;              call co_rotot_Rtot_dev ( y(1:nsc), rh(2), rg(2) )
+    do s = 1, nsc; y(s) = PCELL(s,ibp,jbp,kbp); end do; call co_rotot_Rtot_dev ( y(1:nsc), rh(3), rg(3) )
+    do s = 1, nsc; y(s) = PCELL(s,ibm,jbm,kbm); end do; call co_rotot_Rtot_dev ( y(1:nsc), rh(4), rg(4) )
+    do s = 1, nsc; y(s) = PCELL(s,icp,jcp,kcp); end do; call co_rotot_Rtot_dev ( y(1:nsc), rh(5), rg(5) )
+    do s = 1, nsc; y(s) = PCELL(s,icm,jcm,kcm); end do; call co_rotot_Rtot_dev ( y(1:nsc), rh(6), rg(6) )
+    do s = 1, nsc; y(s) = Pg(s,3); end do;              call co_rotot_Rtot_dev ( y(1:nsc), rh(7), rg(7) )
+    do s = 1, nsc; y(s) = Pg(s,4); end do;              call co_rotot_Rtot_dev ( y(1:nsc), rh(8), rg(8) )
+    do s = 1, nsc; y(s) = Pg(s,5); end do;              call co_rotot_Rtot_dev ( y(1:nsc), rh(9), rg(9) )
+    do s = 1, nsc; y(s) = Pg(s,6); end do;              call co_rotot_Rtot_dev ( y(1:nsc), rh(10), rg(10) )
+
+    do s = 1, nprim
+      pv(1) = PCELL(s,Im,Jm,Km);    pv(2) = Pg(s,1)
+      pv(3) = PCELL(s,ibp,jbp,kbp); pv(4) = PCELL(s,ibm,jbm,kbm)
+      pv(5) = PCELL(s,icp,jcp,kcp); pv(6) = PCELL(s,icm,jcm,kcm)
+      pv(7) = Pg(s,3); pv(8) = Pg(s,4); pv(9) = Pg(s,5); pv(10) = Pg(s,6)
+      ! Visc_Variables, variable s of each cell
+      if ( s >= nu .and. s <= nw ) then
+        do kk = 1, 10; vv(kk) = pv(kk); end do
+      else if ( s == np ) then
+        do kk = 1, 10; vv(kk) = pv(kk) / (rh(kk)*rg(kk)); end do
+      else
+        do kk = 1, 10; vv(kk) = pv(kk) / rh(kk); end do
+      end if
+      gl(ia) = ( vv(2) - vv(1) ) * modfm2
+      gl(ib) = ( vv(3) - vv(4) ) * 0.5d0
+      gl(ic) = ( vv(5) - vv(6) ) * 0.5d0
+      gg(ia) = ( vv(1) - vv(2) ) * (-modfm2)
+      gg(ib) = ( vv(8) - vv(7) ) * 0.5d0
+      gg(ic) = ( vv(10) - vv(9) ) * 0.5d0
+      do kk = 1, 3
+        G2loc(s,kk)   = gl(1)*M(1,kk) + gl(2)*M(2,kk) + gl(3)*M(3,kk)
+        G2ghost(s,kk) = gg(1)*M(1,kk) + gg(2)*M(2,kk) + gg(3)*M(3,kk)
+      end do
+      Prim_avg(s) = 0.5d0*( pv(1) + pv(2) )
+    end do
+
+    call Diffusive_Face_State ( Prim_avg, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml )
+    call Compute_Diffusive_Flux_St ( Prim_avg, G2loc,   Area, Normal, Waldis, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml, Flux_loc )
+    call Compute_Diffusive_Flux_St ( Prim_avg, G2ghost, Area, Normal, Waldis, rho_f, Tint, Tdiff_f, cp_f, mil_f, kl_f, Dml, Flux_ghost )
+
+    do s = 1, nprim
+      WRCELL(s,Im,Jm,Km) = WRCELL(s,Im,Jm,Km) - 0.5d0 * modfm2 * ( Flux_loc(s) + Flux_ghost(s) )
+    end do
+
+  end subroutine BC_Connection_Visc_lean
 
 
   !> Device twin of BC_Rotational_Periodic_Eul (3D wedge seam, faces 5-6).

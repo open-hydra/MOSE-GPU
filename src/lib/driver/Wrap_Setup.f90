@@ -169,6 +169,8 @@ contains
           simulation%config%iter_from_call = 0
           simulation%config%dump_dt = obj_io%sol_dtime   ! dump-clip period (a runtime re-read of sol-dtime is NOT followed)
         enddo
+        ! mr-restart: the counters and the multirate partition of a native restart file (OUTPUT/field_state_r<rank>.bin)
+        if ( .not. simulation%config%newrun ) call Read_Restart_State ( simulation )
         call Setup_Device_Residency ( simulation%domain(1) )
         call Fill_Ghost_Cell_Setup ( simulation%domain(1) )
 
@@ -309,6 +311,57 @@ contains
 
   
   end subroutine MOSE_setup
+
+
+  !> mr-restart: read OUTPUT/<field>_state_r<rank>.bin next to the native restart file (Wrap_Postprocess
+  !> Write_Restart_State). Applied only if its time is the time of the field read, to the bit; else a warning and nothing.
+  subroutine Read_Restart_State ( simulation )
+    use MOSE_Types_m
+    use MOSE_IO_Solution, only: obj_io
+    use MOSE_Mod_MPI, only: mpi_rank_, mpi_is_root
+    use MOSE_Mod_Multirate_Partition, only: MR_Read_State
+    use MOSE_Wrap_Postprocess, only: id_stampa
+    implicit none
+    type(MOSE_simulation_type), intent(inout) :: simulation
+    integer   :: u, ver, it, itg, ntd, k, ids
+    real(8)   :: t, tfc
+    logical   :: ex, ok
+    character(len=16)  :: rk_
+    character(len=512) :: fname
+    if ( trim(obj_io%rst_format(1)) /= 'native' ) return
+    k = index(obj_io%nameinit, '.bin', back=.true.)
+    if ( k <= 1 ) return
+    write(rk_,'(I0)') mpi_rank_
+    fname = obj_io%nameinit(1:k-1)//'_state_r'//trim(rk_)//'.bin'
+    inquire ( file=trim(fname), exist=ex )
+    if ( .not. ex ) then
+      if ( mpi_is_root ) write(*,'(A)') ' [restart] no '//trim(fname)//': counters and multirate partition start afresh'
+      return
+    end if
+    open ( newunit=u, file=trim(fname), form='unformatted', access='stream', status='old', convert='big_endian' )
+    read(u) ver
+    ! version 2 also holds the number of the output files (id_stampa: field<n>.tec goes on from the run that wrote it)
+    ids = -1
+    if ( ver >= 2 ) then
+      read(u) t, it, itg, ntd, tfc, ids
+    else
+      read(u) t, it, itg, ntd, tfc
+    end if
+    if ( t /= simulation%domain(1)%time ) then
+      if ( mpi_is_root ) write(*,'(A,ES24.16,A,ES24.16)') ' [restart] WARNING: '//trim(fname)//' is of time ', t, &
+        ', the field of ', simulation%domain(1)%time, ': ignored'
+      close(u); return
+    end if
+    simulation%domain(1)%iter = it
+    simulation%config%iter_general = itg
+    obj_io%n_tdump = ntd
+    if ( ids >= 0 ) id_stampa = ids
+    simulation%config%time_from_call = tfc
+    call MR_Read_State ( simulation%domain(1), u, ok )
+    close(u)
+    if ( mpi_is_root ) write(*,'(A,I0,A,I0,A,I0,A,L1)') ' [restart] '//trim(fname)//': iter ', it, ', time-based dumps ', ntd, &
+      ', output files ', max(ids, 0), ', multirate partition ', ok
+  end subroutine Read_Restart_State
 
 
 end module MOSE_Wrap_Setup

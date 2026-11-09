@@ -1,4 +1,5 @@
 module MOSE_Mod_Thermo_Cache
+  use MOSE_Lib_Multirate_Base, only: mr_q   ! expl-async: the stage queue of the block kernels
   ! Per-cell thermo scratchpad, refreshed once per RK stage and once before
   ! Compute_dt. Replaces redundant co_rotot_Rtot / T = p/(rho R) /
   ! f_laminarViscosity calls scattered across Mod_Diffusive, Mod_dt, Mod_SST,
@@ -26,6 +27,7 @@ contains
     use MOSE_Types_m
     use MOSE_Mod_MPI, only: is_local_block
     use MOSE_Global_m, only: gc, VISC
+    use MOSE_Lib_Multirate_Base, only: mr_stage_on, mr_block_active, mr_nbox, mr_get_box, mr_list_on, mrtl, obj_mr, mr_q_async
 
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
@@ -36,11 +38,43 @@ contains
     ! halo-refreshed GHOST shell needs the rrt pass. Ignored on the host path (full
     ! refresh recomputes identical values — correct, just no saving).
     logical, intent(in), optional :: shell_only
-    integer :: b
+    integer :: b, ib, lo(3), hi(3)
     logical :: shell_l, guard_once
 
     shell_l = .false.; guard_once = .false.
     if (present(shell_only)) shell_l = shell_only
+
+    ! Multirate stage: the boxes of the stage's level and two cells around them (the stencil of their faces), ghosts
+    ! included -- rho/Rg/T over that range, then rho/Rg/T + the viscosity on its interior part (the values the whole-block
+    ! sweep gives these cells); one guard read for the stage.
+    ! On a list level (mr-list-level) the same cells in two launches over all blocks, written to the flat cache (the one the
+    ! list kernels read; the block caches are refreshed by Compute_dt and the box stages that read them).
+    if ( mr_list_on() ) then
+      if ( mrtl(obj_mr%lcur)%na > 0 ) call Thermo_Cache_rrt_list ( mrtl(obj_mr%lcur)%ca, mrtl(obj_mr%lcur)%na )
+      if ( VISC ) then
+        if ( mrtl(obj_mr%lcur)%nb > 0 ) call Thermo_Cache_fused_list ( mrtl(obj_mr%lcur)%cb, mrtl(obj_mr%lcur)%nb )
+        ! mr-async: the guard (a host read of a device counter) after the wait at the end of the stage (MR_Stage)
+        if ( .not. mr_q_async() ) call thermo_guard_report ( -1, domain%blk(1)%dim, domain%iter )
+      end if
+      return
+    end if
+    if ( mr_stage_on() ) then
+      do b = 1, domain % nb
+        if (.not. is_local_block(b)) cycle
+        if (.not. mr_block_active(b)) cycle
+        do ib = 1, mr_nbox(b)
+          call mr_get_box ( b, ib, domain%blk(b)%dim, lo, hi )
+          lo = max( lo - gc, 1 - gc ); hi = min( hi + gc, domain%blk(b)%dim + gc )
+          call Thermo_Cache_rrt_blk ( b, domain%blk(b)%dim, lo(1), hi(1), lo(2), hi(2), lo(3), hi(3), &
+                 domain%blk(b)%rho_c, domain%blk(b)%Rg_c, domain%blk(b)%T_c )
+          if (VISC) &
+          call Thermo_Cache_fused_blk ( b, domain%blk(b)%dim, domain%blk(b)%rho_c, domain%blk(b)%Rg_c, domain%blk(b)%T_c, &
+                 domain%blk(b)%mil_c, max(lo, 1), min(hi, domain%blk(b)%dim) )
+        end do
+      end do
+      if ( VISC .and. .not. mr_q_async() ) call thermo_guard_report ( -1, domain%blk(1)%dim, domain%iter )   ! async: MR_Stage
+      return
+    end if
 
     ! Per-stage thermo cache on the var-LAST flat SoA w. w is kept
     ! resident + current per substage in Explicit_Step BEFORE this cache call (n=1:
@@ -56,8 +90,8 @@ contains
       if (VISC) then
         if (.not. shell_l) &
         call Thermo_Cache_fused_blk ( b, domain%blk(b)%dim, domain%blk(b)%rho_c,      &
-               domain%blk(b)%Rg_c, domain%blk(b)%T_c, domain%blk(b)%mil_c )
-        call thermo_guard_report ( b, domain%blk(b)%dim, domain%iter )
+               domain%blk(b)%Rg_c, domain%blk(b)%T_c, domain%blk(b)%mil_c, (/1,1,1/), domain%blk(b)%dim )
+        if ( .not. mr_q_async() ) call thermo_guard_report ( b, domain%blk(b)%dim, domain%iter )   ! expl-async: after the join
         call Thermo_Cache_rrt_shell_blk ( b, domain%blk(b)%dim, domain%blk(b)%rho_c,  &
                domain%blk(b)%Rg_c, domain%blk(b)%T_c )
       else if (shell_l) then
@@ -70,7 +104,7 @@ contains
                domain%blk(b)%rho_c, domain%blk(b)%Rg_c, domain%blk(b)%T_c )
       end if
     enddo
-    if ( guard_once ) call thermo_guard_report ( -1, domain%blk(1)%dim, domain%iter )   ! 5i: one device read per list stage
+    if ( guard_once .and. .not. mr_q_async() ) call thermo_guard_report ( -1, domain%blk(1)%dim, domain%iter )   ! 5i: one device read per list stage
     return
   end subroutine Refresh_Thermo_Cache
 
@@ -191,14 +225,74 @@ contains
 
   ! ---- from Mod_Thermo_Cache_W.f90 (MOSE_Mod_Thermo_Cache) ----
 
+  !> The thermo cache of a multirate list level: rho/Rg/T (Thermo_Cache_rrt_blk) on the cells of the list, to the flat cache.
+  subroutine Thermo_Cache_rrt_list ( cl, n )
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use MOSE_Field_m, only: rho_c_f, T_c_f, Rg_c_f
+    integer, intent(in) :: n, cl(n)
+    integer  :: e, s, c0
+    real(R8) :: rho, Rg, rl(nsc)
+    !$acc parallel loop gang vector present(P_flat, cl, rho_c_f, T_c_f, Rg_c_f) private(rl, rho, Rg, c0, s) async(mr_q)
+    do e = 1, n
+      c0 = cl(e)
+      do s = 1, nsc
+        rl(s) = P_flat(c0,s)
+      end do
+      call co_rotot_Rtot_dev ( rl(1:nsc), rho, Rg )
+      rho_c_f(c0) = rho; T_c_f(c0) = P_flat(c0,np) / ( rho * Rg ); Rg_c_f(c0) = Rg
+    end do
+  end subroutine Thermo_Cache_rrt_list
+
+  !> ... and rho/Rg/T + the viscosity with the guard (Thermo_Cache_fused_blk) on the interior cells of the list.
+  subroutine Thermo_Cache_fused_list ( cl, n )
+    use MOSE_Lib_Multirate_Base, only: mr_q
+    use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, co_mi_lam_Wilke_dev
+    use MOSE_Field_m, only: rho_c_f, T_c_f, Rg_c_f, mil_c_f
+    integer, intent(in) :: n, cl(n)
+    integer  :: e, s, c0, T_i, Tint(2), ib
+    real(R8) :: rho, Rg, T, Tdiff, mil, rl(nsc)
+    logical  :: guard_
+    guard_ = thermo_guard_on
+    !$acc parallel loop gang vector async(mr_q) present(P_flat, cl, rho_c_f, T_c_f, Rg_c_f, mil_c_f) &
+    !$acc&  private(rl, rho, Rg, T, T_i, Tdiff, Tint, mil, c0, s, ib)
+    do e = 1, n
+      c0 = cl(e)
+      do s = 1, nsc
+        rl(s) = P_flat(c0,s)
+      end do
+      call co_rotot_Rtot_dev ( rl(1:nsc), rho, Rg )
+      T = P_flat(c0,np) / ( rho * Rg )
+      if ( guard_ ) then
+        if ( .not. ( T > 1.0_R8 .and. T < 9990.0_R8 ) ) then   ! NaN fails both tests
+          !$acc atomic capture
+          tg_nbad = tg_nbad + 1
+          ib = tg_nbad
+          !$acc end atomic
+          if ( ib == 1 ) then
+            tg_c0 = c0; tg_b = 0; tg_T = T; tg_rho = rho; tg_p = P_flat(c0,np)
+          end if
+          if ( T /= T ) T = 300.0_R8
+          T = min( max(T, 1.0_R8), 9990.0_R8 )
+        end if
+      end if
+      rho_c_f(c0) = rho; T_c_f(c0) = T; Rg_c_f(c0) = Rg
+      T_i = idint(T); Tdiff = T - T_i
+      Tint(1) = T_i; Tint(2) = T_i + 1
+      call co_mi_lam_Wilke_dev ( rl(1:nsc), rho, Tint, Tdiff, mil )
+      mil_c_f(c0) = mil
+    end do
+  end subroutine Thermo_Cache_fused_list
+
   !> FUSED interior sweep: rho/Rg/T (rrt) AND transport+cp (visc) from ONE gather of
   !> the species row. Bit-exact vs the split kernels: T_c/rho_c are IEEE doubles, so
   !> using the just-computed rho/T locally is bitwise the store+reload the split visc
   !> kernel performs; Wilke/cp receive identical inputs in identical order.
-  subroutine Thermo_Cache_fused_blk ( b, n, rho_c, Rg_c, T_c, mil_c)
+  subroutine Thermo_Cache_fused_blk ( b, n, rho_c, Rg_c, T_c, mil_c, lo, hi )
     use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, co_mi_lam_Wilke_dev
     use MOSE_Field_m, only: rho_c_f, T_c_f, Rg_c_f, mil_c_f, n_cache_f
     integer,  intent(in) :: b, n(3)
+    integer,  intent(in) :: lo(3), hi(3)   ! the interior cells swept (the whole block, or a multirate box)
     real(R8), dimension(1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(inout) :: rho_c, Rg_c, T_c
     real(R8), dimension(1-gc:n(1)+gc, 1-gc:n(2)+gc, 1-gc:n(3)+gc), intent(inout) :: mil_c
     integer  :: i, j, k, s, c0, boff, pi, pj, T_i, Tint(2)
@@ -208,17 +302,18 @@ contains
     ! launch parameters for free.
     integer :: ib
     logical :: guard_
-    integer :: nb1_, nb2_, nb3_
+    integer :: nb1_, nb2_, nb3_, lo1_, hi1_, lo2_, hi2_, lo3_, hi3_
     nb1_ = n(1); nb2_ = n(2); nb3_ = n(3)
+    lo1_ = lo(1); hi1_ = hi(1); lo2_ = lo(2); hi2_ = hi(2); lo3_ = lo(3); hi3_ = hi(3)
     call field_block_index_params(b, boff, pi, pj)
 
     !$acc data copy(rho_c, Rg_c, T_c, mil_c)
     guard_ = thermo_guard_on
-    !$acc parallel loop collapse(3) gang vector present(P_flat, rho_c, Rg_c, T_c, mil_c, rho_c_f, T_c_f, Rg_c_f, mil_c_f) &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) present(P_flat, rho_c, Rg_c, T_c, mil_c, rho_c_f, T_c_f, Rg_c_f, mil_c_f) &
     !$acc&  private(rl, rho, Rg, T, T_i, Tdiff, Tint, mil, c0, s, ib)
-    do k = 1, n(3)
-    do j = 1, n(2)
-    do i = 1, n(1)
+    do k = lo3_, hi3_
+    do j = lo2_, hi2_
+    do i = lo1_, hi1_
       c0 = boff + (i+gc-1) + (j+gc-1)*pi + (k+gc-1)*pi*pj + 1
       do s = 1, nsc
         rl(s) = P_flat(c0,s)
@@ -273,7 +368,7 @@ contains
     call field_block_index_params(b, boff, pi, pj)
 
     !$acc data copy(rho_c, Rg_c, T_c)
-    !$acc parallel loop collapse(3) gang vector present(P_flat, rho_c, Rg_c, T_c, rho_c_f, T_c_f, Rg_c_f) &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) present(P_flat, rho_c, Rg_c, T_c, rho_c_f, T_c_f, Rg_c_f) &
     !$acc&  private(rl, rho, Rg, c0, s)
     do k = 1-gc, nb3_+gc
     do j = 1-gc, nb2_+gc
@@ -309,7 +404,7 @@ contains
     call field_block_index_params(b, boff, pi, pj)
 
     !$acc data copy(rho_c, Rg_c, T_c)
-    !$acc parallel loop collapse(3) gang vector present(P_flat, rho_c, Rg_c, T_c, rho_c_f, T_c_f, Rg_c_f) &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) present(P_flat, rho_c, Rg_c, T_c, rho_c_f, T_c_f, Rg_c_f) &
     !$acc&  private(rl, rho, Rg, c0, s)
     do k = lo3, hi3
     do j = lo2, hi2
@@ -343,7 +438,7 @@ contains
     call field_block_index_params(b, boff, pi, pj)
 
     !$acc data copyin(rho_c, T_c) copy(mil_c)
-    !$acc parallel loop collapse(3) gang vector present(P_flat, rho_c, T_c, mil_c, mil_c_f) &
+    !$acc parallel loop collapse(3) gang vector async(mr_q) present(P_flat, rho_c, T_c, mil_c, mil_c_f) &
     !$acc&  private(rl, T, T_i, Tdiff, Tint, mil, c0, s)
     do k = 1, n(3)
     do j = 1, n(2)
@@ -413,10 +508,18 @@ contains
   !> The report itself.
   subroutine thermo_guard_dump ()
     use MOSE_Mod_MPI, only: mpi_rank_
+    use MOSE_Field_m, only: dboff
     implicit none
     integer :: boff, pi, pj, c0, i, j, k, rem, s_
     real(R8) :: wl(nprim)
     !$acc update host(tg_c0, tg_b, tg_T, tg_rho, tg_p)
+    if ( tg_b == 0 ) then   ! a multirate list kernel: the block whose flat rows hold the cell
+      tg_b = 1
+      do while ( tg_b < size(dboff) )
+        if ( dboff(tg_b+1) >= tg_c0 ) exit
+        tg_b = tg_b + 1
+      end do
+    end if
     call field_block_index_params(tg_b, boff, pi, pj)
     c0 = tg_c0 - boff - 1; k = c0 / (pi*pj); rem = c0 - k*pi*pj; j = rem / pi; i = rem - j*pi
     i = i - gc + 1; j = j - gc + 1; k = k - gc + 1

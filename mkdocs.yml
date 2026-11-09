@@ -95,6 +95,7 @@ nav:
     - Input File: user/input.md
     - Supported Options: user/options.md
     - Boundary Conditions: user/boundary-conditions.md
+    - Multirate: user/multirate.md
 
   - Theoretical Guide:
     - theory/index.md

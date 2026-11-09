@@ -13,6 +13,12 @@ module MOSE_Mod_Explicit
   implicit none
 
   logical, save :: field_check_done      = .false.  ! Phase-2 field-map self-test runs once per run
+  ! MOSE_open Mod_Explicit: stage k of an explicit Runge-Kutta scheme of n_RK stages evaluates its right-hand side on an
+  ! approximation of the solution at t^n + RKtheta(n_RK,k)*dt: forward Euler 0; Heun 0, 1; SSP RK3 0, 1, 1/2.
+  ! Read by the boundary data of type 667 (MOSE_open 410) only: domain%time stays t^(n+1) during the stages.
+  real(R8), parameter :: RKtheta(3,3) = reshape([ 0._R8, 0._R8,  0._R8, &
+                                                  0._R8, 1._R8,  0._R8, &
+                                                  0._R8, 1._R8, 0.5_R8 ], shape(RKtheta), order=[2,1])
 
 contains
 
@@ -61,7 +67,7 @@ contains
     use MOSE_IO_Solution
     use MOSE_Lib_Soot
     use MOSE_Lib_RotatingFrame, only: RotatingFrame_Source_Terms
-    use MOSE_Mod_Thermo_Cache, only: Refresh_Thermo_Cache
+    use MOSE_Mod_Thermo_Cache, only: Refresh_Thermo_Cache, thermo_guard_report
     use MOSE_Mod_MPI, only: is_local_block, mpi_reduce_sum_r8_array, &
                            mpi_is_root, mpi_bcast_logical, mpi_bcast_integer, mpi_size_
     use MOSE_IO_RANS, only: obj_rans
@@ -69,6 +75,10 @@ contains
                             field_update_P_flat_host, unpack_flat_to_P, &
                             field_update_PO_flat_host, unpack_flat_to_PO, &
                             field_add_R_to_R_flat
+    use MOSE_Mod_BC_Q2D, only: q2d_time, q2d_time_set
+    use MOSE_Lib_Multirate_Base, only: obj_mr, mr_ptoc, mr_q, mr_q_async, mr_async_setup, mr_set_queue_expl, mr_set_queue_sync, &
+                                       mr_landed, mr_output_landed, mr_t_land
+    use MOSE_Mod_Multirate, only: MR_Macro_Step, MR_Macro_Step_Redo
 
     implicit none
     integer, intent(in)                   :: MGL
@@ -78,11 +88,25 @@ contains
     external :: External_Function
     ! Local
     logical  :: endsim, iosim, endmg, need_host_P, res_needs_host_P
+    logical  :: mr_land_on   !< mr-land: the time-based output of the multirate follows mr_output_landed
     integer  :: i_rk, i_strang, b
-    real(R8) :: average(nres)
+    real(R8) :: average(nres), time_old
+    integer(8) :: cq_
+    integer(8), save :: cq_end = -1_8
 
+    if ( obj_mr%profile ) then   ! mr-profile: the wall since the end of the previous step (the caller's print, probes, output)
+      if ( cq_end >= 0 ) then
+        call mr_ptoc ( obj_mr%tit(3), cq_end ); cq_ = cq_end
+      else
+        call system_clock ( cq_ )
+      end if
+    end if
 
     config % change_MG = .false.
+    time_old = domain(level) % time   ! t^n: the stage times of the boundary data of type 667 (MOSE_open 410)
+    q2d_time_set = .false.
+    mr_landed = .false.; mr_output_landed = .false.   ! mr-land: set again by Compute_dt (MR_Land) for this step
+    mr_land_on = obj_mr%drive .and. obj_mr%land .and. config % time_accurate
     domain(level) % iter = domain(level) % iter + 1
     config % iter_from_call = config % iter_from_call + 1
     config % iter_general   = config % iter_general + 1
@@ -100,10 +124,33 @@ contains
       if ( config % time_accurate ) then
         call Set_Global_dt ( domain(level) )  ! Time-accurate: apply global minimum time step
         domain(level) % time = domain(level) % time + domain(level) % dtglobal 
+        if ( mr_landed ) domain(level) % time = mr_t_land   ! mr-land: the instant itself, assigned
       endif
     endif
+    if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tit(1), cq_ )   ! Compute_dt, the partition included
      
 
+    if ( obj_mr%drive ) then
+    ! multirate = t: the levels over the macro step (Mod_Multirate) in place of the RK stages below; the partition and each
+    ! cell's sub-step were set by Compute_dt and Set_Global_dt
+    if ( obj_mr%nonlocal == 2 ) then   ! mr-nonlocal = redo: the attempt loop around the macro step
+      call MR_Macro_Step_Redo ( domain(level), config, External_Function, time_old )
+    else
+      call MR_Macro_Step ( domain(level), config, External_Function, time_old )
+    end if
+    call mr_set_queue_sync ()   ! mr-async-blk: the stage queue is async on every level; Compute_dt and the output are synchronous
+    if ( obj_mr%profile ) then
+      !$acc wait
+      call system_clock ( cq_ )
+    end if
+    else
+    ! expl-async: the per-block kernels of the stage on the stage queue (Lib_Multirate_Base mr_set_queue_expl); one thread
+    call mr_async_setup ( domain(level) % nb )
+    call mr_set_queue_expl ()
+    ! the stage queue only where every kernel of the stage is on it: the sources of SA and Wilcox2006 (Mod_Spalart,
+    ! Mod_Wilcox2006) and the host sources (rotating frame, soot) are synchronous launches that read the wall ghost and add
+    ! to R_flat with no order against the queued boundary fluxes (2D_viscous_flat-plate-turbulent_SA moved): synchronous
+    if ( ( RANS .and. eddy_dev /= 1 ) .or. ROTATING_FRAME .or. soot ) call mr_set_queue_sync ()
     !$omp parallel
     strang: do i_strang = 1, N_strang ! Strang splitting: L = L_rk(dt/2) * L_chem(dt) * L_rk(dt/2)
 
@@ -115,6 +162,13 @@ contains
         ! more. w interior is maintained by Compute_dt's one-time init + Newstate + chemistry.
         !$omp single
         if (.not. field_is_allocated()) call field_alloc(domain(level))
+        ! Boundary data of type 667 (MOSE_open 410): in a time-accurate step the stage time of MOSE_open,
+        ! t^n + (i_strang - 1 + theta) * strangcoeff * dt (Carpenter et al., ICASE Report 93-83), strangcoeff = 1 / N_strang
+        if ( config % time_accurate .or. config % HYDRA_time_accurate ) then
+          q2d_time = time_old + ( real(i_strang - 1, R8) + RKtheta(obj_rk%n_RK, i_rk) ) &
+                                * ( 1._R8 / real(N_strang, R8) ) * domain(level) % dtglobal
+          q2d_time_set = .true.
+        end if
         !$omp end single
         call Fill_Ghost_Cell ( domain(level) )
         ! At substage (1,1) the interior cache
@@ -124,6 +178,12 @@ contains
         ! refresh; strang-2 substage 1 refreshes fully too (chemistry rewrote w).
         call Refresh_Thermo_Cache ( domain(level), shell_only = ( i_strang == 1 .and.   &
                i_rk == 1 .and. .not. config % HYDRA_time_accurate ) )
+        if ( mr_q_async() ) then   ! expl-async: the fluxes run on the synchronous stream: join the queue; then the guard
+          !$omp single
+          !$acc wait(mr_q)
+          if ( VISC ) call thermo_guard_report ( -1, domain(level)%blk(1)%dim, domain(level)%iter )
+          !$omp end single
+        end if
         call Fluxes ( domain(level) )                        ! Convective and Diffusive fluxes
 
         call BC_Fluxes ( domain(level) )                     ! Boundary fluxes
@@ -193,10 +253,18 @@ contains
         ! omega-source-relax: the point-implicit SST destruction on the resident residual R_flat
         if ( obj_omega_relax%active ) then
           !$omp single
+          if ( mr_q_async() ) then   ! expl-async: the relaxation runs on the synchronous queue
+            !$acc wait(mr_q)
+          end if
           call Omega_Relax_Source ( domain(level) )
           !$omp end single
         end if
         call RK_Newstate ( domain(level), i_rk )             ! State update
+        if ( mr_q_async() ) then   ! expl-async: the end of the stage
+          !$omp single
+          !$acc wait(mr_q)
+          !$omp end single
+        end if
         if ( obj_omega_relax%active ) then   ! omega >= rho * omfloor on the updated state
           !$omp single
           call Omega_Relax_Floor ( domain(level) )
@@ -227,6 +295,8 @@ contains
 
     enddo strang
     !$omp end parallel
+    call mr_set_queue_sync ()   ! expl-async: back to the synchronous queue (Compute_dt, the output)
+    end if
     ! OVERHEAD FIX: host P is read ONLY by Compute_Residual (periodic) and I/O writes, so
     ! gate the whole-field D2H+transpose to those iters (was unconditional, ~40% of loop).
     ! residuotot-based termination only fires on a residual iter (residuotot fresh) -> covered.
@@ -240,7 +310,8 @@ contains
                   .or. res_needs_host_P &
                   .or. ( mod (domain(level) % iter, obj_io%sol_diter) == 0 ) &
                   .or. ( mod (domain(level) % iter, obj_io%bck_diter) == 0 ) &
-                  .or. ( domain(level) % time >= config % time_from_call + obj_io%sol_dtime ) &
+                  .or. ( mr_land_on .and. mr_output_landed ) &
+                  .or. ( .not. mr_land_on .and. domain(level) % time >= config % time_from_call + obj_io%sol_dtime ) &
                   .or. ( config % iter_from_call >= domain(level) % itermax ) &
                   .or. ( domain(level) % time >= config % timemax )
     ! w is the resident truth; P is not maintained in the loop. Refresh the host
@@ -301,7 +372,8 @@ contains
 
       iosim  = ( mod (domain(level) % iter, obj_io%sol_diter) == 0) &
           .or. ( mod (domain(level) % iter, obj_io%bck_diter) == 0) &
-          .or. ( domain(level) % time >= config % time_from_call + obj_io%sol_dtime )
+          .or. ( mr_land_on .and. mr_output_landed ) &
+          .or. ( .not. mr_land_on .and. domain(level) % time >= config % time_from_call + obj_io%sol_dtime )
 
       if ( endsim ) then
         config % TODO = 3
@@ -318,6 +390,9 @@ contains
     ! Broadcast simulation control from root to all ranks
     call mpi_bcast_integer(config % TODO)
     call mpi_bcast_logical(config % change_MG)
+    if ( obj_mr%profile ) then   ! the rest of the step: residual, host copies, the end tests
+      call mr_ptoc ( obj_mr%tit(2), cq_ ); cq_end = cq_
+    end if
       
   end subroutine Explicit_Step
 
