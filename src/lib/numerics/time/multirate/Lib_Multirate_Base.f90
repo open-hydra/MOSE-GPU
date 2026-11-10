@@ -78,6 +78,9 @@ module MOSE_Lib_Multirate_Base
     integer  :: nsince = 0, nlight = 0, nfull = 0, npass = 0
     integer  :: nrounds = 0, nseam = 0, nviol = 0, nwallc = 0
     integer  :: nifc = 0                  !< interface faces of this rank (telescoping slots)
+    ! mr-reuse (Mod_Multirate_Partition mr_build_from_levels): the ladder the structures were built for, the cells whose level
+    ! differs from that build at the last full partition (all ranks; -1: not compared), the full partitions that kept them
+    integer  :: Lbuilt = -1, nchg = -1, nreuse = 0
     ! stage
     logical  :: in_stage = .false.        !< inside a stage of the ladder: the kernels take the boxes of level lcur
     integer  :: lcur = 0, irkcur = 1
@@ -115,7 +118,8 @@ module MOSE_Lib_Multirate_Base
   integer, public :: mr_q = -1
   integer, public :: mr_qid = -1
   logical, public :: mr_async = .false.
-  public :: mr_async_setup, mr_set_queue, mr_q_async, mr_set_queue_expl, mr_set_queue_sync
+  public :: mr_async_setup, mr_set_queue, mr_q_async, mr_set_queue_expl, mr_set_queue_sync, mr_flux_async, mr_q_flux
+  public :: mr_fanout_on, mr_fanout_q
 
 
 
@@ -130,6 +134,7 @@ module MOSE_Lib_Multirate_Base
   !> launch of BC_Fluxes_blk (Mod_BC bc_launch_ranges): bcl(bco(g,l)+1 : bco(g,l)+bcn(g,l)) on the device.
   type, public :: mr_blk_type
     integer,  allocatable :: lev(:,:,:), lev2(:,:,:), cls(:,:,:)
+    integer,  allocatable :: levb(:,:,:)   !< mr-reuse: host copy of the levels the structures were built from
     real(R8), allocatable :: dtcap(:,:,:)
     real(R8), allocatable :: dtc(:,:,:), dmin(:,:,:)                      !< mr-nonlocal: step of the stage, smallest seen
     real(R8), allocatable :: crho(:,:,:), crg(:,:,:), ct(:,:,:), cmil(:,:,:)   !< mr-nonlocal: its thermo scratch (with ghosts)
@@ -825,5 +830,57 @@ contains
   logical function mr_q_async ()
     mr_q_async = mr_async .and. ( mr_q == mr_qid )
   end function mr_q_async
+
+  !> mr-async-flux (MOSE_MR_ASYNC_FLUX, default on): the per-block flux kernels of a block-path stage (Mod_Fluxes
+  !> Fluxes_blk: beta, the convective and diffusive pass 1 with the face thermo, the telescoping, pass 2) on the stage
+  !> queue as well, in program order on its one stream (the same result to the bit), instead of synchronous launches after
+  !> a join of the queue (nsys 315348: ~200 000 host waits in 30 macro steps, 102 637 of them in the face thermo fill).
+  logical function mr_flux_async ()
+    logical, save :: checked = .false., on = .true.
+    character(len=8) :: env
+    integer :: st, ln
+    if ( .not. checked ) then
+      checked = .true.
+      call get_environment_variable ( 'MOSE_MR_ASYNC_FLUX', env, ln, st )
+      if ( st == 0 .and. ln > 0 ) then
+        if ( env(1:1) == '0' .or. env(1:1) == 'n' .or. env(1:1) == 'N' .or. env(1:1) == 'f' .or. env(1:1) == 'F' ) on = .false.
+      end if
+    end if
+    mr_flux_async = on
+  end function mr_flux_async
+
+  !> The queue of the per-block flux kernels: the stage queue inside a multirate stage (the synchronous one there with
+  !> MOSE_MR_ASYNC_FLUX=0, MR_Stage sets it), the synchronous one outside (the explicit step keeps its per-block fluxes).
+  integer function mr_q_flux ()
+    use openacc, only: acc_async_sync
+    mr_q_flux = acc_async_sync
+    if ( mr_stage_on() ) mr_q_flux = mr_q
+  end function mr_q_flux
+
+  !> mr-flux-fanout (MOSE_MR_FLUX_FANOUT, default on): on a list level with the async stage chain, the independent work of
+  !> a stage on side queues forked from the stage queue and joined back to it -- the six pass-1 flux chains (convective of
+  !> each direction; face thermo + diffusive of each direction: each writes only its own direction's arrays) and the
+  !> coarser levels' halo interpolations (each writes only the cells of its own level). Each kernel computes what it did on
+  !> the one queue, from the same inputs: the same result to the bit. On a small level the kernels fill a few
+  !> multiprocessors each, so side by side they overlap instead of queueing.
+  logical function mr_fanout_on ()
+    logical, save :: checked = .false., on = .true.
+    character(len=8) :: env
+    integer :: st, ln
+    if ( .not. checked ) then
+      checked = .true.
+      call get_environment_variable ( 'MOSE_MR_FLUX_FANOUT', env, ln, st )
+      if ( st == 0 .and. ln > 0 ) then
+        if ( env(1:1) == '0' .or. env(1:1) == 'n' .or. env(1:1) == 'N' .or. env(1:1) == 'f' .or. env(1:1) == 'F' ) on = .false.
+      end if
+    end if
+    mr_fanout_on = on .and. mr_q_async()
+  end function mr_fanout_on
+
+  !> The k-th side queue of mr-flux-fanout (k = 1..6), above the stage queue mr_qid and the list-build queue mr_qid + 1.
+  integer function mr_fanout_q ( k )
+    integer, intent(in) :: k
+    mr_fanout_q = mr_qid + 1 + k
+  end function mr_fanout_q
 
 end module MOSE_Lib_Multirate_Base

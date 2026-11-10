@@ -119,6 +119,7 @@ contains
     use MOSE_Global_m,   only: gc, nprim, nsc, nu, nv, nw, np, nt, nrans, RANS, VISC
     use MOSE_Field_m,    only: P_flat, R_flat, field_block_index_params, ncell_total, rho_c_f, T_c_f
     use MOSE_Lib_RANS,   only: sc_dev, sct_dev, prt_dev, stress_dev, eddy_dev, mcdiff_dev
+    use MOSE_Lib_Multirate_Base, only: mr_q_flux
     use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
     integer, intent(in) :: b
     integer, dimension(3), intent(in) :: n
@@ -140,15 +141,16 @@ contains
     call field_block_index_params(b, boff, pi, pj)
     tblock = dim3(128, 1, 1)   ! flat 1D launches
     ! Stream-ordered CUF: see the twin comment in Convective_Flux -- pass-1 launches
-    ! on the OpenACC sync-queue's stream, the 6 host barriers here are compiled out.
-    strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
+    ! on the OpenACC sync-queue's stream, the 6 host barriers here are compiled out. In a multirate stage the stage
+    ! queue's stream (mr-async-flux, Lib_Multirate_Base mr_q_flux), with the face thermo fills on that queue.
+    strm = acc_get_cuda_stream(int(mr_q_flux(), acc_handle_kind))
 
     ! ---- i-direction ----
     o1 = max(lo(1)-1, 1); h1 = min(hi(1), n1-1); o2 = lo(2); h2 = hi(2); o3 = lo(3); h3 = hi(3)
     nfc_ = (h1-o1+1)*(h2-o2+1)*(h3-o3+1)
     if (nfc_ > 0) then
     grid = dim3((nfc_ + 127)/128, 1, 1)
-    call Diffusive_Face_Thermo_Fill ( b, 1, n, o1, h1, o2, h2, o3, h3 )   ! sync-queue kernel: complete (or stream-ordered) before pass-1 reads tface
+    call Diffusive_Face_Thermo_Fill ( b, 1, n, o1, h1, o2, h2, o3, h3 )   ! same queue as pass 1: stream-ordered before it reads tface
     !$acc host_data use_device(P_flat, dfhat, fm1, M, yn, rho_c_f, T_c_f, tface)
     if (mcdiff_dev) then
     call diff_cuf_i_mc<<<grid,tblock,0,strm>>>(P_flat, dfhat, fm1, M, yn, rho_c_f, T_c_f, tface, &
@@ -247,10 +249,11 @@ contains
     use MOSE_Global_m, only: nsc, np
     use FLINT_Lib_ThermoTransport_dev, only: co_rotot_Rtot_dev, f_cp_dev, co_k_mi_lam_Wilke_dev, co_DS_expr_dev
     use MOSE_Lib_RANS, only: mcdiff_dev, prl_dev
+    use MOSE_Lib_Multirate_Base, only: mr_q_flux
     integer, intent(in) :: b, dir
     integer, dimension(3), intent(in) :: n
     integer, intent(in) :: o1, h1, o2, h2, o3, h3   ! the faces of direction dir (the launcher's range)
-    integer  :: i, j, k, s, f, c1, c2, boff, pi, pj, T_i, Tint(2)
+    integer  :: i, j, k, s, f, c1, c2, boff, pi, pj, T_i, Tint(2), q_
     real(R8) :: Prim(NPRIM_DEV), rho, Rgas, T, Tdiff, cp, mil, kl
     real(R8) :: Dk(NPRIM_DEV)   ! DIFF_MC: the face D_k (co_DS_expr_dev), columns 6:5+nsc
     logical  :: mcd_
@@ -273,10 +276,11 @@ contains
       tface_resident = .true.
     end if
     mcd_ = mcdiff_dev
+    q_ = mr_q_flux()   ! the queue of the pass-1 launch that reads tface
     call field_block_index_params(b, boff, pi, pj)
     select case (dir)
     case (1)
-      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
+      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) async(q_) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
       do k = o3, h3
       do j = o2, h2
@@ -306,7 +310,7 @@ contains
         end if
       end do ; end do ; end do
     case (2)
-      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
+      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) async(q_) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
       do k = o3, h3
       do j = o2, h2
@@ -336,7 +340,7 @@ contains
         end if
       end do ; end do ; end do
     case (3)
-      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) &
+      !$acc parallel loop collapse(3) gang vector present(P_flat, tface) async(q_) &
       !$acc&  private(Prim, Tint, s, f, c1, c2, T_i, rho, Rgas, T, Tdiff, cp, mil, kl, Dk)
       do k = o3, h3
       do j = o2, h2
@@ -508,13 +512,18 @@ contains
 
   !> The diffusive pass 1 of a multirate level on its face lists (Mod_Fluxes Fluxes_List): per direction the face thermo
   !> of the list (Diffusive_Face_Thermo_Fill_List), then the flux kernel, one launch each over every local block.
-  subroutine Diffusive_Flux_List ( fl )
+  subroutine Diffusive_Flux_List ( fl, dsel )
     use MOSE_Lib_Multirate_Base, only: mr_fl_type
     type(mr_fl_type), intent(inout) :: fl(3)
-    integer :: d
+    integer, optional, intent(in) :: dsel   ! one direction only (mr-flux-fanout), else all three
+    integer :: d, d0, d1
     if (.not. VISC) return
     call dcuf_init_tables()
-    do d = 1, 3
+    d0 = 1; d1 = 3
+    if ( present(dsel) ) then
+      d0 = dsel; d1 = dsel
+    end if
+    do d = d0, d1
       if (fl(d)%n == 0) cycle
       call Diffusive_Face_Thermo_Fill_List ( fl(d)%tf, fl(d)%c, fl(d)%sa, fl(d)%n, size(fl(d)%tf, 2) )
       call diff_list_launch ( fl(d)%dfh, fl(d)%n, d, fl(d)%c, fl(d)%sa, fl(d)%sb, fl(d)%sc, fl(d)%fm, fl(d)%mm, fl(d)%yn, &

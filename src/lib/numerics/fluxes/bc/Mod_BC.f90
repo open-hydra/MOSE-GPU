@@ -652,7 +652,7 @@ contains
     use MOSE_Field_m, only: P_flat, R_flat, ncell_total, field_is_allocated, field_alloc, &
                             pack_P_to_flat, field_update_P_flat_device, field_block_index_params
     use MOSE_Lib_Preconditioning, only: ur_f, Prec_Alloc
-    use MOSE_Lib_Multirate_Base, only: mr_block_active, mr_stage_on, mrb, obj_mr, mr_rec_on, mrbl, mr_q_async
+    use MOSE_Lib_Multirate_Base, only: mr_block_active, mr_stage_on, mrb, obj_mr, mr_rec_on, mrbl, mr_q_async, mr_q
     use MOSE_Global_m, only: gc, nprim
     use MOSE_Mod_BC_Q2D, only: q2d_time, q2d_time_set
 
@@ -752,6 +752,11 @@ contains
         call bc_lists ( bla )
         return
       end if
+    end if
+    ! the per-block launches below run on the block queues qb: with the stage queue async (mr-async), what it still holds
+    ! (the ghost fills, and the per-block fluxes with mr-async-flux: pass 2 writes R_flat) completes first
+    if ( mr_q_async() ) then
+      !$acc wait(mr_q)
     end if
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle

@@ -36,6 +36,9 @@ module MOSE_Lib_Extrapolation
   !> wall-value is the former device fill (SA nu-tilde ghost = -interior, SST k ghost = -interior and omega ghost =
   !> 2 omega_wall - interior; default before 2026-10-16).
   logical, save :: rans_wall_copy = .true.
+  ! pg-early (Mod_GhostExchange xch_pg_early): the Pg receives of this stage were posted in _start (rx), the Pg was packed
+  ! and sent in _start (tx); _finish then skips them.
+  logical, save :: pg_rx_early = .false., pg_tx_early = .false.
 
 contains
 
@@ -341,7 +344,7 @@ contains
     use MOSE_Mod_GhostExchange, only: exchange_ghost_P_post_recv, exchange_ghost_P_post_send, &
                                        exchange_ghost_P_pack, xch_lazy_setup, &
                                        exchange_ghost_Pg_post_recv, exchange_ghost_Pg_pack, &
-                                       exchange_ghost_Pg_post_send
+                                       exchange_ghost_Pg_post_send, xch_pg_early_on, xch_pg_early
     use openacc, only: acc_async_sync
     use MOSE_Mod_MPI, only: halo_acc
     use MOSE_Lib_Multirate_Base, only: mr_q, mr_q_async
@@ -364,6 +367,10 @@ contains
 
     ! (1) Post persistent P receives (device- or host-bound per gpu_aware_mpi_runtime).
     call exchange_ghost_P_post_recv(domain)
+    ! pg-early: the Pg receives with the P receives (the receive buffer is free: the previous stage's Pg unpack ran on the
+    ! stage queue, joined by the wait(mr_q) above)
+    pg_rx_early = ( mr_q_async() .and. xch_pg_early_on() )
+    if ( pg_rx_early ) call exchange_ghost_Pg_post_recv()
     call system_clock(h1); call halo_acc(1, real(h1-h0,8)/real(hr,8)); h0 = h1
 
     ! (2) Pack the P send buffer ON DEVICE from resident P, then post sends.
@@ -390,6 +397,16 @@ contains
     ! still reads correct donor interior. With SST_Blk now on w, no P-ghost reader remains.
     call Fill_Ghost_Cell_local ( domain, async_q=Q_OVERLAP, skip_chimera=.true., skip_transverse=.true. )   ! pass 2 + chimera in _finish
     call system_clock(h1); call halo_acc(3, real(h1-h0,8)/real(hr,8)); h0 = h1
+    ! pg-early: no shipped Pg entry of this level on this rank reads a ghost another rank fills (xch_build_levels), so the
+    ! values it packs are interior cells and the ghosts of the local fill only -- the same values the pack after the P
+    ! unpack would read (that unpack writes other cells). Pack on Q_OVERLAP after the local fill (the pack joins the
+    ! queue), send: the Pg travels with P instead of after it.
+    pg_tx_early = ( pg_rx_early .and. xch_pg_early() )
+    if ( pg_tx_early ) then
+      call exchange_ghost_Pg_pack(domain, async_q=Q_OVERLAP)
+      call exchange_ghost_Pg_post_send()
+      call system_clock(h1); call halo_acc(4, real(h1-h0,8)/real(hr,8)); h0 = h1
+    end if
 
     ! Join (correctness): join Q_OVERLAP HERE -- BEFORE the step-(3b) Pg pack. The Pg
     ! transverse gather reads the donor P at Is+-d11, Js+-d12, ... which, for connection faces
@@ -405,6 +422,7 @@ contains
     ! aliasing). recv MUST be posted before send (matched persistent requests, distinct tag).
     ! (3b) moved to Fill_Ghost_Cell_mr_finish, after the P unpack: the transverse Pg pack reads donor ghosts at the face
     ! edges, and those another rank fills must hold THIS stage's value (the one-rank order), not the previous stage's.
+    ! A level whose Pg reads none of them is sent above (pg-early).
 
   end subroutine Fill_Ghost_Cell_mr_start
 
@@ -450,12 +468,14 @@ contains
     ! and the receiver-normal rows bc_pg(:,1:gc) of the inter-rank entries.
     !$acc wait(Q_OVERLAP)
     call system_clock(hw1); call halo_acc(6, real(hw1-hw0,8)/real(hwrate,8)); hw0 = hw1
-    call exchange_ghost_Pg_post_recv()
-    call exchange_ghost_Pg_pack(domain, async_q=qs)
-    if ( mr_q_async() ) then   ! the MPI send reads the packed buffer: the pack must be complete
-      !$acc wait(qs)
+    if ( .not. pg_rx_early ) call exchange_ghost_Pg_post_recv()
+    if ( .not. pg_tx_early ) then   ! pg-early: already packed and sent in _start
+      call exchange_ghost_Pg_pack(domain, async_q=qs)
+      if ( mr_q_async() ) then   ! the MPI send reads the packed buffer: the pack must be complete
+        !$acc wait(qs)
+      end if
+      call exchange_ghost_Pg_post_send()
     end if
-    call exchange_ghost_Pg_post_send()
     call system_clock(hw1); call halo_acc(4, real(hw1-hw0,8)/real(hwrate,8)); hw0 = hw1
     call Fill_Ghost_Transverse_local ( domain, async_q=qs )
     call fill_bc_pg_transverse(domain, async_q=qs)

@@ -31,12 +31,19 @@ module MOSE_Mod_Multirate_Partition
   integer, parameter :: LD_CH = 1024
   integer, allocatable :: ld_flg(:), ld_pos(:), ld_p1(:), ld_p2(:), ld_p3(:), ld_csum(:), ld_coff(:)
   integer :: ld_q = -1   !< the async queue of the list kernels (above the block and stage queues); -1 = synchronous
+  ! mr-build-fast (mr_build_fast_on): the scan in sub-chunks of LD_SC (LD_NS per chunk) with their sums ld_ssum (lt_ss for
+  ! the thermo lists); the counts of every block of a level (ld_cnt(7, nb)) and the changed cells of the nesting rule (ld_nc)
+  ! summed on the device and read back once
+  integer, parameter :: LD_SC = 32, LD_NS = LD_CH / LD_SC
+  integer, allocatable :: ld_ssum(:), ld_cnt(:,:), ld_nc(:)
   ! mr-thermo-exact scratch (mr_build_thermo_list_dev): the read mark of every flat cell, the interior flag, flags and positions
-  integer, allocatable :: lt_mark(:), lt_int(:), lt_fa(:), lt_pa(:), lt_fb(:), lt_pb(:), lt_cs(:), lt_co(:)
+  integer, allocatable :: lt_mark(:), lt_int(:), lt_fa(:), lt_pa(:), lt_fb(:), lt_pb(:), lt_cs(:), lt_co(:), lt_ss(:)
   ! mr-ghost-exact (mr_mark_reads_dev): 1 on the flat cells whose primitives a stage of the level reads; host copy for the
   ! ghost-record choice of mr_build_ghost_list
   integer, allocatable :: rk_mark(:)
   logical :: rk_ready = .false.
+  ! the census of every rank (the root prints it with the census line, multi-rank runs): cells per level, column = rank
+  real(R8), allocatable :: mr_histr(:,:)
 
 contains
 
@@ -48,7 +55,7 @@ contains
     type(MOSE_domain_type), intent(inout) :: domain
     type(config_type),      intent(in)    :: config
     logical, save :: setup_done = .false.
-    integer  :: b, L, ipass, nchg, rnd, l_
+    integer  :: b, L, ipass, nchg, rnd, l_, r_
     integer(8) :: c0_, c1_, cr_, cp_
     real(R8) :: Hreq, Htry, hcap, tmp, sump, hist(0:MR_LMAX_HARD), cnt(2), smax, dtcmax
     integer  :: Lh
@@ -147,7 +154,10 @@ contains
     ! mr-octaves (diagnostic, prints only): the admissible steps of the cells in octaves above the smallest, and the ideal
     ! work of other macro steps, at the first full partition and every 10th after it
     if ( obj_mr%octaves .and. ( obj_mr%nfull == 1 .or. mod(obj_mr%nfull, 10) == 0 ) ) call mr_octave_census ( domain )
-    call mr_build_from_levels ( domain, L, cp_ )   ! census, finest populated level, boxes, lists, halo
+    call mr_build_from_levels ( domain, L, cp_, reuse = .true. )   ! census, finest populated level, boxes, lists, halo
+    if ( mpi_is_root .and. obj_mr%profile ) write(*,'(A,I0,A,I0,A,I0,A,L1)') ' [MR] iter ', domain%iter, &
+      '  full partition ', obj_mr%nfull, '  cells whose level changed since the last build ', obj_mr%nchg, &
+      '  structures kept ', ( obj_mr%nchg == 0 .and. mr_reuse_on() )
     tmp = sum(obj_mr%hist)
 
     obj_mr%Hreq = Hreq; obj_mr%Hcap = hcap
@@ -165,8 +175,19 @@ contains
         write(*,'(A,I0,A,F8.4)',advance='no') '  L', l_, ' ', 100.0_R8*obj_mr%hist(l_)/max(tmp,1.0_R8)
       end do
       write(*,'(A)') ''
+      if ( allocated(mr_histr) ) then   ! multi-rank: each rank's cells per level and its work (sum of cells x 2^level)
+        do r_ = 0, size(mr_histr, 2) - 1
+          write(*,'(A,I0,A)',advance='no') ' [MR]   rank ', r_, ' cells per level:'
+          do l_ = 0, L
+            write(*,'(A,I0,A,I0)',advance='no') '  L', l_, ' ', nint(mr_histr(l_, r_))
+          end do
+          write(*,'(A,ES11.4)') '   work ', sum( (/ ( mr_histr(l_, r_) * 2.0_R8**l_, l_ = 0, L ) /) )
+        end do
+      end if
       write(*,'(A,I0,A,I0,A,I0)') ' [MR]   connection cells raised by R2 (round 1, this rank) ', obj_mr%nseam, &
         '  interior faces |dl| > 1 after the rules ', obj_mr%nviol, '  interface faces (this rank) ', obj_mr%nifc
+      write(*,'(A,I0,A,I0,A,I0)') ' [MR]   mr-reuse: cells whose level changed since the last build (all ranks) ', &
+        obj_mr%nchg, '  full partitions that kept the structures ', obj_mr%nreuse, ' of ', obj_mr%nfull
       if ( obj_mr%nviol > 0 ) write(*,'(A)') ' [MR]   WARNING: faces jump more than one level -- the halo and the ' // &
         'telescoping assume |dl| <= 1'
     end if
@@ -178,21 +199,34 @@ contains
   !> The structures of the levels mrb%lev (device copy current): the census (hist, C_p, face jumps), the finest populated
   !> level (L trimmed), the host copy of the levels, the boxes, the inter-rank masks, the interface faces, the boundary
   !> lists, the face and cell lists, the halo lists. Run by the full partition and by a restart (mr_restore_state).
-  subroutine mr_build_from_levels ( domain, L, cp_ )
+  !> reuse (the full partition; mr-reuse, MOSE_MR_REUSE=0 turns it off): when no cell of any rank changed level since the
+  !> last build and the ladder is the same, the structures are kept -- they depend on the levels and the geometry only, so
+  !> the stages are the same to the bit (open-hydra MOSE feature/multirate-integrator, Build_Map, Mod_Multirate.f90
+  !> 4039-4057 there: Build_Lists only if a cell changed level in any process).
+  subroutine mr_build_from_levels ( domain, L, cp_, reuse )
     use MOSE_Types_m
-    use MOSE_Mod_MPI, only: is_local_block, mpi_allreduce_sum_r8_array
+    use MOSE_Mod_MPI, only: is_local_block, mpi_allreduce_sum_r8_array, mpi_size_, mpi_rank_
     implicit none
     type(MOSE_domain_type), intent(inout) :: domain
     integer,    intent(inout) :: L
     integer(8), intent(inout) :: cp_
+    logical, optional, intent(in) :: reuse
     integer  :: b
-    real(R8) :: tmp, sump, hist(0:MR_LMAX_HARD), cnt(2)
+    real(R8) :: tmp, sump, hist(0:MR_LMAX_HARD), hb(0:MR_LMAX_HARD), cnt(2)
     ! census of the final levels
     sump = 0.0_R8; hist = 0.0_R8
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle
-      call mr_census_blk ( mrb(b)%lev, domain%blk(b)%dim, hist, sump )
+      hb = 0.0_R8
+      call mr_census_blk ( mrb(b)%lev, domain%blk(b)%dim, hb, sump )
+      hist = hist + hb   ! whole numbers: the same sums as accumulating in place
+      if ( mr_block_census_on() ) call mr_block_census_write ( domain, b, hb )
     end do
+    if ( mpi_size_ > 1 ) then   ! the census of every rank, for the root's print (load of each level per rank)
+      if ( .not. allocated(mr_histr) ) allocate ( mr_histr(0:MR_LMAX_HARD, 0:mpi_size_-1) )
+      mr_histr = 0.0_R8; mr_histr(:, mpi_rank_) = hist
+      call mpi_allreduce_sum_r8_array ( mr_histr, (MR_LMAX_HARD+1)*mpi_size_ )
+    end if
     call mpi_allreduce_sum_r8_array ( hist, MR_LMAX_HARD+1 )
     tmp = sum(hist)
     cnt(1) = sump; cnt(2) = 0.0_R8
@@ -212,6 +246,28 @@ contains
       if (.not. is_local_block(b)) cycle
       !$acc update host(mrb(b)%lev)
     end do
+    ! mr-reuse: the cells whose level differs from the build the structures hold (cnt(2) > 0: a rank without a build, or
+    ! another ladder)
+    obj_mr%nchg = -1
+    if ( present(reuse) ) then
+      cnt = 0.0_R8
+      if ( obj_mr%Lbuilt /= L ) cnt(2) = 1.0_R8
+      do b = 1, domain % nb
+        if (.not. is_local_block(b)) cycle
+        if ( .not. allocated(mrb(b)%levb) ) then
+          cnt(2) = 1.0_R8
+        else
+          cnt(1) = cnt(1) + real( count( mrb(b)%lev /= mrb(b)%levb ), R8 )
+        end if
+      end do
+      call mpi_allreduce_sum_r8_array ( cnt, 2 )
+      if ( cnt(2) < 0.5_R8 ) obj_mr%nchg = nint(cnt(1))
+      if ( reuse .and. mr_reuse_on() .and. obj_mr%nchg == 0 ) then
+        obj_mr%nreuse = obj_mr%nreuse + 1
+        if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tpb(1), cp_ )
+        return
+      end if
+    end if
     if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tpb(1), cp_ )   ! mr-profile: the parts of the full partitions
     call mr_build_boxes ( domain, L )
     if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tpb(2), cp_ )
@@ -224,7 +280,64 @@ contains
     if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tpb(8), cp_ )
     if ( obj_mr%drive .and. obj_mr%listlev >= 0 ) call mr_build_halo_near ( domain, L )
     if ( obj_mr%profile ) call mr_ptoc ( obj_mr%tpb(9), cp_ )
+    ! mr-reuse: the levels these structures are built from
+    do b = 1, domain % nb
+      if (.not. is_local_block(b)) cycle
+      if ( .not. allocated(mrb(b)%levb) ) allocate ( mrb(b)%levb, mold = mrb(b)%lev )
+      mrb(b)%levb = mrb(b)%lev
+    end do
+    obj_mr%Lbuilt = L
   end subroutine mr_build_from_levels
+
+  !> MOSE_MR_BLOCK_CENSUS=1 (diagnostic, default off): every build of the level structures appends the cells per level of
+  !> each local block to OUTPUT/mr_block_census_r<rank>.txt (full partition number, iteration, block, rank, levels 0..8):
+  !> the per-block load of the levels, for a block-to-rank map that balances each level (INPUT/block_owner.txt).
+  logical function mr_block_census_on ()
+    logical, save :: checked = .false., on = .false.
+    character(len=8) :: ev
+    integer :: st
+    if ( .not. checked ) then
+      checked = .true.
+      call get_environment_variable ( 'MOSE_MR_BLOCK_CENSUS', ev, status = st )
+      if ( st == 0 ) on = ( ev(1:1) == '1' .or. ev(1:1) == 'y' .or. ev(1:1) == 'Y' .or. ev(1:1) == 't' .or. ev(1:1) == 'T' )
+    end if
+    mr_block_census_on = on
+  end function mr_block_census_on
+
+  subroutine mr_block_census_write ( domain, b, hb )
+    use MOSE_Types_m
+    use MOSE_Mod_MPI, only: mpi_rank_
+    implicit none
+    type(MOSE_domain_type), intent(in) :: domain
+    integer,  intent(in) :: b
+    real(R8), intent(in) :: hb(0:MR_LMAX_HARD)
+    integer, save :: u = 0
+    logical, save :: opened = .false.
+    character(len=64) :: fn
+    if ( .not. opened ) then   ! newunit= gives a negative unit number
+      opened = .true.
+      write(fn,'(A,I0,A)') 'OUTPUT/mr_block_census_r', mpi_rank_, '.txt'
+      open ( newunit = u, file = trim(fn), status = 'replace' )
+      write(u,'(A)') '# full_partition iter block rank cells_L0 .. cells_L8'
+    end if
+    write(u,'(I6,I9,I5,I4,9I9)') obj_mr%nfull, domain%iter, b, mpi_rank_, nint(hb)
+    flush(u)
+  end subroutine mr_block_census_write
+
+  !> mr-reuse (MOSE_MR_REUSE, default on): a full partition with the map of the last build keeps its structures.
+  logical function mr_reuse_on ()
+    logical, save :: checked = .false., on = .true.
+    character(len=8) :: env
+    integer :: st, ln
+    if ( .not. checked ) then
+      checked = .true.
+      call get_environment_variable ( 'MOSE_MR_REUSE', env, ln, st )
+      if ( st == 0 .and. ln > 0 ) then
+        if ( env(1:1) == '0' .or. env(1:1) == 'n' .or. env(1:1) == 'N' .or. env(1:1) == 'f' .or. env(1:1) == 'F' ) on = .false.
+      end if
+    end if
+    mr_reuse_on = on
+  end function mr_reuse_on
 
 
   !> mr-nonlocal = redo (open-hydra MOSE feature/multirate-integrator, Mod_Multirate.f90 737-757 there): after a violation of
@@ -851,6 +964,26 @@ contains
     integer, intent(in) :: L
     integer :: b, p, nc
     nchg = 0
+    if ( mr_build_fast_on() ) then
+      ! mr-build-fast: the passes of every block on the list queue (in order: block b's pass p reads its pass p-1), the
+      ! changed cells summed on the device, one read back -- not one synchronous reduction per block and pass
+      ld_q = domain % nb + 65
+      if ( .not. allocated(ld_nc) ) then
+        allocate ( ld_nc(1) )
+        !$acc enter data create(ld_nc)
+      end if
+      call ld_set_i ( ld_nc, 1, 0 )
+      do p = 1, L
+        do b = 1, domain % nb
+          if (.not. is_local_block(b)) cycle
+          call mr_nest_blk_q ( mrb(b)%lev, mrb(b)%lev2, domain%blk(b)%dim, ld_nc )
+        end do
+      end do
+      !$acc update host(ld_nc) async(ld_q)
+      !$acc wait(ld_q)
+      nchg = ld_nc(1)
+      return
+    end if
     do p = 1, L
       do b = 1, domain % nb
         if (.not. is_local_block(b)) cycle
@@ -893,6 +1026,45 @@ contains
     end do
     nc = c
   end subroutine mr_nest_blk
+
+  !> mr-build-fast: mr_nest_blk on the list queue; the changed cells of each chunk of LD_CH cells added to nc(1) (one atomic
+  !> per chunk; integers, so the order of the additions does not matter). The same levels as mr_nest_blk.
+  subroutine mr_nest_blk_q ( lev, lev2, n, nc )
+    implicit none
+    integer, intent(in)    :: n(3)
+    integer, intent(inout) :: lev(n(1),n(2),n(3)), lev2(n(1),n(2),n(3)), nc(1)
+    integer :: i, j, k, n1, n2, n3, m, c, ncell, nch, ch, e, r
+    n1 = n(1); n2 = n(2); n3 = n(3); ncell = n1*n2*n3; nch = (ncell + LD_CH - 1) / LD_CH
+    !$acc parallel loop gang async(ld_q) present(lev, lev2, nc) private(c)
+    do ch = 1, nch
+      c = 0
+      !$acc loop vector reduction(+:c) private(i, j, k, r, m)
+      do e = (ch-1)*LD_CH + 1, min(ch*LD_CH, ncell)
+        r = e - 1; i = mod(r, n1) + 1; r = r / n1; j = mod(r, n2) + 1; k = r / n2 + 1
+        m = lev(i,j,k)
+        if (i > 1)  m = max(m, lev(i-1,j,k) - 1)
+        if (i < n1) m = max(m, lev(i+1,j,k) - 1)
+        if (j > 1)  m = max(m, lev(i,j-1,k) - 1)
+        if (j < n2) m = max(m, lev(i,j+1,k) - 1)
+        if (k > 1)  m = max(m, lev(i,j,k-1) - 1)
+        if (k < n3) m = max(m, lev(i,j,k+1) - 1)
+        if (m /= lev(i,j,k)) c = c + 1
+        lev2(i,j,k) = m
+      end do
+      if ( c > 0 ) then
+        !$acc atomic update
+        nc(1) = nc(1) + c
+      end if
+    end do
+    !$acc parallel loop collapse(3) gang vector async(ld_q) present(lev, lev2)
+    do k = 1, n3
+    do j = 1, n2
+    do i = 1, n1
+      lev(i,j,k) = lev2(i,j,k)
+    end do
+    end do
+    end do
+  end subroutine mr_nest_blk_q
 
 
   !> Interior faces of the local blocks whose two cells differ by more than one level (0 after the rules).
@@ -1510,6 +1682,23 @@ contains
     mr_list_dev_on = on
   end function mr_list_dev_on
 
+  !> mr-build-fast: MOSE_MR_BUILD_FAST (default on; 0/n/N/f/F = off) -- the in-chunk prefix of ld_scan by sub-chunks, the
+  !> counts of the list build and the changed cells of the nesting rule summed on the device with one read back. Integers
+  !> only: the same levels, lists and positions either way (the switch is for A/B timing).
+  logical function mr_build_fast_on ()
+    logical, save :: checked = .false., on = .true.
+    character(len=8) :: env
+    integer :: st, ln
+    if ( .not. checked ) then
+      checked = .true.
+      call get_environment_variable ( 'MOSE_MR_BUILD_FAST', env, ln, st )
+      if ( st == 0 .and. ln > 0 ) then
+        if ( env(1:1) == '0' .or. env(1:1) == 'n' .or. env(1:1) == 'N' .or. env(1:1) == 'f' .or. env(1:1) == 'F' ) on = .false.
+      end if
+    end if
+    mr_build_fast_on = on
+  end function mr_build_fast_on
+
   !> The face and cell lists of level l_ built on the device, in the order of the host build (blocks ascending, faces and
   !> cells in lexicographic i-j-k order within a block): per block, a count kernel (the sizes, read back once), then per
   !> direction a flag kernel, an exclusive prefix sum (chunks of 1024: sums, their scan, the in-chunk prefix) and a gather
@@ -1537,18 +1726,39 @@ contains
     end do
     if ( allocated(ld_flg) ) then
       if ( size(ld_flg) < nmax ) then
-        !$acc exit data delete(ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff)
-        deallocate ( ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff )
+        !$acc exit data delete(ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff, ld_ssum)
+        deallocate ( ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff, ld_ssum )
       end if
     end if
     if ( .not. allocated(ld_flg) ) then
-      allocate ( ld_flg(nmax), ld_pos(nmax), ld_p1(nmax), ld_p2(nmax), ld_p3(nmax), ld_csum(nmax/LD_CH+2), ld_coff(nmax/LD_CH+2) )
-      !$acc enter data create(ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff)
+      allocate ( ld_flg(nmax), ld_pos(nmax), ld_p1(nmax), ld_p2(nmax), ld_p3(nmax), ld_csum(nmax/LD_CH+2), ld_coff(nmax/LD_CH+2), &
+                 ld_ssum(nmax/LD_SC+2) )
+      !$acc enter data create(ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, ld_csum, ld_coff, ld_ssum)
+    end if
+    if ( .not. allocated(ld_cnt) ) then
+      allocate ( ld_cnt(7, domain % nb) )
+      !$acc enter data create(ld_cnt)
     end if
 
     ld_q = domain % nb + 65   ! one queue for every list kernel of this level: in order, one wait at the end
     ! 1. the sizes: per block (7 reductions), then the totals and the offsets of each block in the level's lists
     allocate ( cntb(7, domain % nb) ); cntb = 0
+    if ( mr_build_fast_on() ) then   ! mr-build-fast: every block's counts on the queue into ld_cnt, one read back
+      call ld_set_i ( ld_cnt, 7 * domain % nb, 0 )
+      do b = 1, domain % nb
+        if (.not. is_local_block(b)) cycle
+        call ld_count_blk_q ( mrb(b)%lev, domain%blk(b)%dim, l_, ld_cnt, domain % nb, b )
+        do d = 1, 3
+          if ( mrb(b)%ifl(d)%n > 0 ) call ld_count_ifl_q ( mrb(b)%ifl(d)%lc, mrb(b)%ifl(d)%n, l_, ld_cnt, domain % nb, b, 4+d )
+        end do
+      end do
+      !$acc update host(ld_cnt) async(ld_q)
+      !$acc wait(ld_q)
+      do b = 1, domain % nb
+        if (.not. is_local_block(b)) cycle
+        cntb(:, b) = ld_cnt(:, b)
+      end do
+    else
     do b = 1, domain % nb
       if (.not. is_local_block(b)) cycle
       nifl = max( mrb(b)%ifl(1)%n, mrb(b)%ifl(2)%n, mrb(b)%ifl(3)%n )
@@ -1562,6 +1772,7 @@ contains
       end do
       cntb(:, b) = cnt
     end do
+    end if   ! mr-build-fast
     nf = 0; ncl = 0; ni = 0
     do b = 1, domain % nb
       nf = nf + cntb(1:3, b); ncl = ncl + cntb(4, b); ni = ni + cntb(5:7, b)
@@ -1612,7 +1823,7 @@ contains
         if ( d == 3 ) nface = n1*n2*(n3-1)
         if ( nface <= 0 ) cycle
         call ld_flag_faces ( mrb(b)%lev, n1, n2, n3, d, l_, ld_flg, nface )
-        call ld_scan ( ld_flg, ld_pos, nface, ld_csum, ld_coff, size(ld_csum) )
+        call ld_scan ( ld_flg, ld_pos, nface, ld_csum, ld_coff, size(ld_csum), ld_ssum, size(ld_ssum) )
         if ( d == 1 ) then
           call ld_gather_faces ( mrb(b)%lev, domain%blk(b)%dl_f, domain%blk(b)%fm1, 0, 1, 1, domain%blk(b)%m_f, domain%blk(b)%yn, &
                                  n1, n2, n3, d, boff, pi, pj, gc, ofs_f(d), ld_flg, ld_pos, ld_p1, nface, &
@@ -1632,7 +1843,7 @@ contains
         ! the interface faces of this direction: positions in the level's list
         if ( mrb(b)%ifl(d)%n > 0 .and. cntb(4+d, b) > 0 ) then
           call ld_flag_ifl ( mrb(b)%ifl(d)%lc, mrb(b)%ifl(d)%n, l_, ld_flg )
-          call ld_scan ( ld_flg, ld_pos, mrb(b)%ifl(d)%n, ld_csum, ld_coff, size(ld_csum) )
+          call ld_scan ( ld_flg, ld_pos, mrb(b)%ifl(d)%n, ld_csum, ld_coff, size(ld_csum), ld_ssum, size(ld_ssum) )
           if ( d == 1 ) then
             call ld_gather_ifl ( mrb(b)%ifl(d)%f, mrb(b)%ifl(d)%lc, mrb(b)%ifl(d)%s, mrb(b)%ifl(d)%n, ld_flg, ld_pos, &
                                  ld_p1, nface, ofs_i(d), mrfl(d,l_)%if_, mrfl(d,l_)%ilc, mrfl(d,l_)%isl, max(ni(d),1) )
@@ -1649,7 +1860,7 @@ contains
       ! the cells of the level in this block, with their six face positions
       if ( cntb(4, b) > 0 ) then
         call ld_flag_cells ( mrb(b)%lev, n1, n2, n3, l_, ld_flg, n1*n2*n3 )
-        call ld_scan ( ld_flg, ld_pos, n1*n2*n3, ld_csum, ld_coff, size(ld_csum) )
+        call ld_scan ( ld_flg, ld_pos, n1*n2*n3, ld_csum, ld_coff, size(ld_csum), ld_ssum, size(ld_ssum) )
         call ld_gather_cells ( mrb(b)%lev, domain%blk(b)%vol, domain%blk(b)%m_f, domain%blk(b)%yn, n1, n2, n3, boff, pi, pj, &
                                gc, ofs_c, ld_flg, ld_pos, ld_p1, ld_p2, ld_p3, nmax, &
                                mrcl(l_)%c, mrcl(l_)%pf, mrcl(l_)%ijk, mrcl(l_)%bo, mrcl(l_)%pp, mrcl(l_)%vol, mrcl(l_)%met, &
@@ -1719,6 +1930,66 @@ contains
     cnt = c
   end subroutine ld_count_ifl
 
+  !> mr-build-fast: ld_count_blk on the list queue, the four sums of each chunk of LD_CH cells added to cnt(1:4, b) (one
+  !> atomic per chunk and sum; integers, so the order of the additions does not matter)
+  subroutine ld_count_blk_q ( lev, n, l_, cnt, nb, b )
+    implicit none
+    integer, intent(in)    :: n(3), l_, nb, b, lev(n(1),n(2),n(3))
+    integer, intent(inout) :: cnt(7, nb)
+    integer :: i, j, k, n1, n2, n3, c1, c2, c3, cc, la, ncell, nch, ch, e, r
+    n1 = n(1); n2 = n(2); n3 = n(3); ncell = n1*n2*n3; nch = (ncell + LD_CH - 1) / LD_CH
+    !$acc parallel loop gang async(ld_q) present(lev, cnt) private(c1, c2, c3, cc)
+    do ch = 1, nch
+      c1 = 0; c2 = 0; c3 = 0; cc = 0
+      !$acc loop vector reduction(+:c1, c2, c3, cc) private(i, j, k, r, la)
+      do e = (ch-1)*LD_CH + 1, min(ch*LD_CH, ncell)
+        r = e - 1; i = mod(r, n1) + 1; r = r / n1; j = mod(r, n2) + 1; k = r / n2 + 1
+        la = lev(i,j,k)
+        if ( la == l_ ) cc = cc + 1
+        if ( i < n1 ) then; if ( la == l_ .or. lev(i+1,j,k) == l_ ) c1 = c1 + 1; end if
+        if ( j < n2 ) then; if ( la == l_ .or. lev(i,j+1,k) == l_ ) c2 = c2 + 1; end if
+        if ( k < n3 ) then; if ( la == l_ .or. lev(i,j,k+1) == l_ ) c3 = c3 + 1; end if
+      end do
+      if ( c1 > 0 ) then
+        !$acc atomic update
+        cnt(1,b) = cnt(1,b) + c1
+      end if
+      if ( c2 > 0 ) then
+        !$acc atomic update
+        cnt(2,b) = cnt(2,b) + c2
+      end if
+      if ( c3 > 0 ) then
+        !$acc atomic update
+        cnt(3,b) = cnt(3,b) + c3
+      end if
+      if ( cc > 0 ) then
+        !$acc atomic update
+        cnt(4,b) = cnt(4,b) + cc
+      end if
+    end do
+  end subroutine ld_count_blk_q
+
+  !> mr-build-fast: ld_count_ifl on the list queue, added to cnt(m, b) per chunk of LD_CH records
+  subroutine ld_count_ifl_q ( lc, n, l_, cnt, nb, b, m )
+    implicit none
+    integer, intent(in)    :: n, l_, nb, b, m, lc(n)
+    integer, intent(inout) :: cnt(7, nb)
+    integer :: q, c, nch, ch
+    nch = (n + LD_CH - 1) / LD_CH
+    !$acc parallel loop gang async(ld_q) present(lc, cnt) private(c)
+    do ch = 1, nch
+      c = 0
+      !$acc loop vector reduction(+:c)
+      do q = (ch-1)*LD_CH + 1, min(ch*LD_CH, n)
+        if ( lc(q) == l_ .or. lc(q) + 1 == l_ ) c = c + 1
+      end do
+      if ( c > 0 ) then
+        !$acc atomic update
+        cnt(m,b) = cnt(m,b) + c
+      end if
+    end do
+  end subroutine ld_count_ifl_q
+
   !> flg(f) = 1 on the faces of direction d (lexicographic index f) with a cell of the level on either side.
   subroutine ld_flag_faces ( lev, n1, n2, n3, d, l_, flg, nface )
     implicit none
@@ -1781,13 +2052,41 @@ contains
 
   !> Exclusive prefix sum of flg(1:n) (0/1) into pos(1:n): chunk sums, their sequential scan, the in-chunk prefix.
   !> Integer arithmetic in a fixed order: the same positions on every run.
-  subroutine ld_scan ( flg, pos, n, csum, coff, ncs )
+  !> mr-build-fast: the in-chunk prefix by one thread per chunk of LD_CH waited on memory (126 us a call on the cone, 2.2 s
+  !> of device time in 38 macro steps at one GPU, nsys of job 315305); the chunk is cut in LD_NS sub-chunks of LD_SC: their
+  !> sums (ssum), the chunk sums from them, the sequential scan of the chunks, then one thread per sub-chunk adds the earlier
+  !> sub-chunks of its chunk and writes its LD_SC positions. Integers: the same positions as the chunk prefix.
+  subroutine ld_scan ( flg, pos, n, csum, coff, ncs, ssum, nss )
     implicit none
-    integer, intent(in)  :: n, ncs
+    integer, intent(in)  :: n, ncs, nss
     integer, intent(in)  :: flg(n)
-    integer, intent(out) :: pos(n), csum(ncs), coff(ncs)
-    integer :: nch, ch, e, lo, hi, s, run
+    integer, intent(out) :: pos(n), csum(ncs), coff(ncs), ssum(nss)
+    integer :: nch, ch, e, lo, hi, s, run, nsub, q, q0, p
+    logical :: fast
     nch = (n + LD_CH - 1) / LD_CH
+    fast = mr_build_fast_on()
+    nsub = (n + LD_SC - 1) / LD_SC
+    if ( fast ) then
+      if ( nsub > nss ) error stop 'ld_scan: the sub-chunk sums do not fit'
+      !$acc parallel loop gang vector async(ld_q) present(flg, ssum) private(lo, hi, s)
+      do q = 1, nsub
+        lo = (q-1)*LD_SC + 1; hi = min(q*LD_SC, n); s = 0
+        !$acc loop seq
+        do e = lo, hi
+          s = s + flg(e)
+        end do
+        ssum(q) = s
+      end do
+      !$acc parallel loop gang vector async(ld_q) present(ssum, csum) private(lo, hi, s)
+      do ch = 1, nch
+        lo = (ch-1)*LD_NS + 1; hi = min(ch*LD_NS, nsub); s = 0
+        !$acc loop seq
+        do p = lo, hi
+          s = s + ssum(p)
+        end do
+        csum(ch) = s
+      end do
+    else
     !$acc parallel loop gang async(ld_q) present(flg, csum) private(lo, hi, s)
     do ch = 1, nch
       lo = (ch-1)*LD_CH + 1; hi = min(ch*LD_CH, n); s = 0
@@ -1797,6 +2096,7 @@ contains
       end do
       csum(ch) = s
     end do
+    end if
     !$acc parallel async(ld_q) present(csum, coff) num_gangs(1) vector_length(1)
     run = 0
     !$acc loop seq
@@ -1805,6 +2105,23 @@ contains
       run = run + csum(ch)
     end do
     !$acc end parallel
+    if ( fast ) then
+      !$acc parallel loop gang vector async(ld_q) present(flg, pos, ssum, coff) private(ch, q0, lo, hi, run)
+      do q = 1, nsub
+        ch = (q-1) / LD_NS + 1; q0 = (ch-1)*LD_NS + 1; run = coff(ch)
+        !$acc loop seq
+        do p = q0, q - 1
+          run = run + ssum(p)
+        end do
+        lo = (q-1)*LD_SC + 1; hi = min(q*LD_SC, n)
+        !$acc loop seq
+        do e = lo, hi
+          pos(e) = run
+          run = run + flg(e)
+        end do
+      end do
+      return
+    end if
     !$acc parallel loop gang async(ld_q) present(flg, pos, coff) private(lo, hi, run)
     do ch = 1, nch
       lo = (ch-1)*LD_CH + 1; hi = min(ch*LD_CH, n); run = coff(ch)
@@ -1968,13 +2285,14 @@ contains
     nct = ncell_total
     if ( allocated(lt_mark) ) then
       if ( size(lt_mark) /= nct ) then
-        !$acc exit data delete(lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co)
-        deallocate ( lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co )
+        !$acc exit data delete(lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co, lt_ss)
+        deallocate ( lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co, lt_ss )
       end if
     end if
     if ( .not. allocated(lt_mark) ) then
-      allocate ( lt_mark(nct), lt_int(nct), lt_fa(nct), lt_pa(nct), lt_fb(nct), lt_pb(nct), lt_cs(nct/LD_CH+2), lt_co(nct/LD_CH+2) )
-      !$acc enter data create(lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co)
+      allocate ( lt_mark(nct), lt_int(nct), lt_fa(nct), lt_pa(nct), lt_fb(nct), lt_pb(nct), lt_cs(nct/LD_CH+2), lt_co(nct/LD_CH+2), &
+                 lt_ss(nct/LD_SC+2) )
+      !$acc enter data create(lt_mark, lt_int, lt_fa, lt_pa, lt_fb, lt_pb, lt_cs, lt_co, lt_ss)
       call lt_fill ( lt_int, nct, 0 )
       do b = 1, domain % nb   ! the interior flag of the flat field, once
         if (.not. is_local_block(b)) cycle
@@ -1998,11 +2316,11 @@ contains
     if ( na == 0 ) call ld_set_i ( mrtl(l_)%ca, 1, 1 )
     if ( nb == 0 ) call ld_set_i ( mrtl(l_)%cb, 1, 1 )
     if ( na > 0 ) then
-      call ld_scan ( lt_fa, lt_pa, nct, lt_cs, lt_co, size(lt_cs) )
+      call ld_scan ( lt_fa, lt_pa, nct, lt_cs, lt_co, size(lt_cs), lt_ss, size(lt_ss) )
       call lt_gather ( lt_fa, lt_pa, nct, mrtl(l_)%ca, na )
     end if
     if ( nb > 0 ) then
-      call ld_scan ( lt_fb, lt_pb, nct, lt_cs, lt_co, size(lt_cs) )
+      call ld_scan ( lt_fb, lt_pb, nct, lt_cs, lt_co, size(lt_cs), lt_ss, size(lt_ss) )
       call lt_gather ( lt_fb, lt_pb, nct, mrtl(l_)%cb, nb )
     end if
     !$acc wait(ld_q)

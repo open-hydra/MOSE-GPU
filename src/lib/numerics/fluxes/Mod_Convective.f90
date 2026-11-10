@@ -587,6 +587,7 @@ contains
     use MOSE_Lib_Limiters, only: SD_space_order, lim_dev
     use MOSE_Lib_Riemann,  only: rs_dev
     use MOSE_Lib_Preconditioning, only: ur_f, Prec_Alloc
+    use MOSE_Lib_Multirate_Base, only: mr_q_flux
     use openacc, only: acc_get_cuda_stream, acc_async_sync, acc_handle_kind
     integer, intent(in) :: b
     integer, dimension(3), intent(in) :: n
@@ -621,7 +622,8 @@ contains
     ! compiled out. Same kernels, same execution order -> bit-exact. ASSUMES one host
     ! thread drives the flux phase (omp single + production OMP_NUM_THREADS=1): OpenACC
     ! queues are per host thread, so a multi-thread driver would break the ordering.
-    strm = acc_get_cuda_stream(int(acc_async_sync, acc_handle_kind))
+    ! In a multirate stage the stage queue's stream (mr-async-flux, Lib_Multirate_Base mr_q_flux).
+    strm = acc_get_cuda_stream(int(mr_q_flux(), acc_handle_kind))
 
     ! ---- i-direction (flat) ----   the interior i-faces of the cells lo..hi (face i between cells i and i+1)
     o1 = max(lo(1)-1, 1); h1 = min(hi(1), n1-1); o2 = lo(2); h2 = hi(2); o3 = lo(3); h3 = hi(3)
@@ -704,14 +706,19 @@ contains
 
 
   !> The convective pass 1 of a multirate level on its face lists (one launch per direction, over every local block).
-  subroutine Convective_Flux_List ( fl )
+  subroutine Convective_Flux_List ( fl, dsel )
     use MOSE_Lib_Preconditioning, only: Prec_Alloc
     use MOSE_Lib_Multirate_Base, only: mr_fl_type
     type(mr_fl_type), intent(inout) :: fl(3)
-    integer :: d
+    integer, optional, intent(in) :: dsel   ! one direction only (mr-flux-fanout), else all three
+    integer :: d, d0, d1
     call cuf_init_tables()
     call Prec_Alloc()
-    do d = 1, 3
+    d0 = 1; d1 = 3
+    if ( present(dsel) ) then
+      d0 = dsel; d1 = dsel
+    end if
+    do d = d0, d1
       if (fl(d)%n == 0) cycle
       call conv_list_launch ( fl(d)%fh, fl(d)%c, fl(d)%sa, fl(d)%dl, fl(d)%fm, fl(d)%n )
     end do

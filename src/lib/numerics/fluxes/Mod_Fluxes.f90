@@ -105,12 +105,31 @@ contains
     use MOSE_Global_m, only: VISC
     use MOSE_Mod_Convective, only: Convective_Flux_List
     use MOSE_Mod_Diffusive,  only: Diffusive_Flux_List
-    use MOSE_Lib_Multirate_Base, only: obj_mr, mrfl, mrcl, MR_Iface_Update_List
+    use MOSE_Lib_Multirate_Base, only: obj_mr, mrfl, mrcl, MR_Iface_Update_List, mr_q, mr_fanout_on, mr_fanout_q
     implicit none
-    integer :: l
+    integer :: l, d, q0, qs
     l = obj_mr%lcur
-    call Convective_Flux_List ( mrfl(:,l) )
-    call Diffusive_Flux_List ( mrfl(:,l) )
+    if ( mr_fanout_on() ) then
+      ! mr-flux-fanout: convective d on side queue d, face thermo + diffusive d on side queue 3+d, all after the stage
+      ! queue's work so far; joined back before the telescoping, which reads all six
+      q0 = mr_q
+      do d = 1, 6
+        qs = mr_fanout_q(d)
+        !$acc wait(q0) async(qs)
+      end do
+      do d = 1, 3
+        mr_q = mr_fanout_q(d);   call Convective_Flux_List ( mrfl(:,l), d )
+        mr_q = mr_fanout_q(3+d); call Diffusive_Flux_List ( mrfl(:,l), d )
+      end do
+      mr_q = q0
+      do d = 1, 6
+        qs = mr_fanout_q(d)
+        !$acc wait(qs) async(q0)
+      end do
+    else
+      call Convective_Flux_List ( mrfl(:,l) )
+      call Diffusive_Flux_List ( mrfl(:,l) )
+    end if
     call MR_Iface_Update_List ( mrfl(:,l), VISC )
     if ( mrcl(l)%n > 0 ) &
       call Flux_Pass2_List ( mrcl(l)%c, mrcl(l)%pf, mrcl(l)%n, mrfl(1,l)%fh, mrfl(2,l)%fh, mrfl(3,l)%fh, &
@@ -179,7 +198,7 @@ contains
     ! Diffusive flux: the CUF kernel reading the resident thermo cache (production,
     ! unconditional).
     use MOSE_Mod_Diffusive, only: Diffusive_Flux
-    use MOSE_Lib_Multirate_Base, only: mr_nbox, mr_get_box, MR_Iface_Update
+    use MOSE_Lib_Multirate_Base, only: mr_nbox, mr_get_box, MR_Iface_Update, mr_q_flux
 
     implicit none
     integer, intent(in) :: b   ! 1-based global block index (w slice, GPU device path)
@@ -218,8 +237,10 @@ contains
     integer :: nb1_, nb2_, nb3_
     ! The cells this call works on: the whole block, or in a multirate stage the boxes of the stage's level (Lib_Multirate_Base)
     integer :: ib, nbx, lo(3), hi(3), bl1_, bh1_, bl2_, bh2_, bl3_, bh3_
+    integer :: q_   ! the queue of the kernels: the stage queue in a multirate stage (mr-async-flux), else synchronous
     nb1_ = n(1); nb2_ = n(2); nb3_ = n(3)
     nbx = mr_nbox(b)
+    q_ = mr_q_flux()
 
     ! copy(Res): the host Res ghost cells are 0 and the reset kernel zeros only
     ! the INTERIOR, so copyout would leave the device Res ghosts uninitialized.
@@ -241,7 +262,7 @@ contains
     lo = max( lo - 1, 1 )   ! the face kernels read beta of the left cell of a face: one cell before the box
     bl1_ = lo(1); bh1_ = hi(1); bl2_ = lo(2); bh2_ = hi(2); bl3_ = lo(3); bh3_ = hi(3)
     if (add_r) then
-      !$acc parallel loop collapse(3) present(Res, beta)
+      !$acc parallel loop collapse(3) present(Res, beta) async(q_)
       do k = bl3_, bh3_
       do j = bl2_, bh2_
       do i = bl1_, bh1_
@@ -249,7 +270,7 @@ contains
         beta(i,j,k)  = 1d0
       end do ; end do ; end do
     else
-      !$acc parallel loop collapse(3) present(beta)
+      !$acc parallel loop collapse(3) present(beta) async(q_)
       do k = bl3_, bh3_
       do j = bl2_, bh2_
       do i = bl1_, bh1_
@@ -263,7 +284,7 @@ contains
       ! on the resident P_flat (ghosts filled before the fluxes); beta of the interior cells, the face takes its left cell's.
       call field_block_index_params(b, boff_sd, pi_sd, pj_sd)
       sdid_ = sd_dev
-      !$acc parallel loop collapse(3) present(P_flat, beta) private(c0_sd)
+      !$acc parallel loop collapse(3) present(P_flat, beta) private(c0_sd) async(q_)
       do k = bl3_, bh3_
       do j = bl2_, bh2_
       do i = bl1_, bh1_
@@ -272,7 +293,7 @@ contains
                                     P_flat(c0_sd-pi_sd*pj_sd,np), P_flat(c0_sd+pi_sd*pj_sd,np) )
       end do ; end do ; end do
     else if (SD) then
-      !$acc parallel loop collapse(3) present(Prim, beta)
+      !$acc parallel loop collapse(3) present(Prim, beta) async(q_)
       do k = bl3_, bh3_
       do j = bl2_, bh2_
       do i = bl1_, bh1_
@@ -342,11 +363,12 @@ contains
     use MOSE_Field_m,  only: R_flat, field_block_index_params
     use MOSE_Mod_Convective, only: fhat, fhat_j, fhat_k
     use MOSE_Mod_Diffusive,  only: dfhat, dfhat_j, dfhat_k
+    use MOSE_Lib_Multirate_Base, only: mr_q_flux
     implicit none
     integer, intent(in) :: b, n(3)
     integer, intent(in) :: lo(3), hi(3)   ! the cells: the whole block, or a box of a multirate stage
     ! Local
-    integer  :: i, j, k, s, f, c0, boff, pi, pj, n1, n2, n3, lo1, hi1, lo2, hi2, lo3, hi3
+    integer  :: i, j, k, s, f, c0, boff, pi, pj, n1, n2, n3, lo1, hi1, lo2, hi2, lo3, hi3, q_
     logical  :: visc_l
     real(R8) :: tmp(NPRIM_DEV)
 
@@ -354,8 +376,9 @@ contains
     n1 = n(1); n2 = n(2); n3 = n(3)
     lo1 = lo(1); hi1 = hi(1); lo2 = lo(2); hi2 = hi(2); lo3 = lo(3); hi3 = hi(3)
     visc_l = VISC
+    q_ = mr_q_flux()
 
-    !$acc parallel loop collapse(3) gang vector &
+    !$acc parallel loop collapse(3) gang vector async(q_) &
     !$acc&  present(R_flat, fhat, fhat_j, fhat_k, dfhat, dfhat_j, dfhat_k) &
     !$acc&  private(s, f, c0, tmp)
     do k = lo3, hi3

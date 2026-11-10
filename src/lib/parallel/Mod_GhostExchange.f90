@@ -158,6 +158,7 @@ module MOSE_Mod_GhostExchange
   !> xch_level < 0 (outside the multirate stages: the explicit step, the setup, the dumps) = the full exchange.
   type :: xch_lvl_type
     integer :: ns = 0, nr = 0, nsg = 0, nrg = 0, ng = 0
+    logical :: pg_early = .false.   !< pg-early: no shipped Pg send entry of the level reads a ghost another rank fills
     integer, allocatable :: sidx(:), ridx(:)                     !< compact entry lists of P (device-resident)
     integer, allocatable :: sidxg(:), ridxg(:), gidx(:)          !< the same for Pg shipped, and the Pg gathered entries
     integer, allocatable :: scnt(:), soff(:), rcnt(:), roff(:)   !< per peer group: entries, first compact position (P)
@@ -182,8 +183,10 @@ module MOSE_Mod_GhostExchange
   type(xch_lvl_type), allocatable, save :: xl(:)   !< (0:xch_nlev-1)
   integer, public, save :: xch_level = -1          !< the level of the exchange in flight (-1 = the full exchange)
   integer, save :: xch_nlev = 0
+  integer, save :: xch_pge_env = -1                !< pg-early switch (MOSE_PG_EARLY): -1 unread, 0 off, 1 on
   integer, save :: xch_env = -1                    !< MOSE_MR_XCH=0 in the environment keeps the full exchange
   public :: ghost_sched_set_level_masks, xch_set_level, xch_level_count, fill_bc_pg_transverse, xch_lazy_setup
+  public :: xch_pg_early_on, xch_pg_early
 
   public :: build_ghost_schedule
   public :: build_local_bc_index
@@ -477,6 +480,22 @@ contains
     if ( .not. allocated(xl) ) return
     xch_level = l
   end subroutine xch_set_level
+
+  !> pg-early (MOSE_PG_EARLY, default on; '0' = off): the level-restricted exchange posts the Pg receives with the P
+  !> receives, and a rank whose shipped Pg entries of the level read no ghost another rank fills packs and sends its Pg
+  !> right after the local fill, in flight with P (the same copies of the same cells: the same result to the bit).
+  logical function xch_pg_early_on ()
+    xch_pg_early_on = ( xch_pge_env == 1 .and. xch_level >= 0 )
+  end function xch_pg_early_on
+
+  !> pg-early: this rank may pack and send the Pg of the level in flight before the P unpack.
+  logical function xch_pg_early ()
+    xch_pg_early = .false.
+    if ( .not. xch_pg_early_on() ) return
+    if ( .not. allocated(xl) ) return
+    if ( xch_level > ubound(xl,1) ) return
+    xch_pg_early = xl(xch_level)%pg_early
+  end function xch_pg_early
 
   !> mr-xch: the entries of the sub-list of level l on this rank (send, receive).
   subroutine xch_level_count ( l, ns, nr, nsg, nrg )
@@ -2220,6 +2239,7 @@ contains
     integer :: ci(4), cj(4), ck(4), n(3)
     logical :: ship
     character(len=8) :: env_val
+    integer :: nlate
     call xch_free_levels ()
     if ( .not. ghost_sched%built ) return
     if ( mpi_size_ <= 1 ) return
@@ -2232,6 +2252,15 @@ contains
       end if
       if ( mpi_is_root .and. xch_env == 0 ) write(*,'(A)') &
         ' [XCH] MOSE_MR_XCH=0: the multirate stages keep the full halo exchange'
+    end if
+    if ( xch_pge_env < 0 ) then
+      xch_pge_env = 1
+      call get_environment_variable ( 'MOSE_PG_EARLY', env_val, env_len, env_stat )
+      if ( env_stat == 0 .and. env_len > 0 ) then
+        if ( env_val(1:1) == '0' ) xch_pge_env = 0
+      end if
+      if ( mpi_is_root .and. xch_pge_env == 0 ) write(*,'(A)') &
+        ' [XCH] MOSE_PG_EARLY=0: the transverse Pg of a level is sent after the P unpack'
     end if
     if ( xch_env == 0 ) return
     if ( .not. ( ghost_sched%dev_bound .and. ghost_sched%bufs_resident .and. ghost_sched%pg_bufs_resident .and. &
@@ -2354,6 +2383,24 @@ contains
       !$acc enter data copyin(xl(l)%sidx, xl(l)%ridx, xl(l)%sidxg, xl(l)%ridxg, xl(l)%gidx)
     end do
     xch_nlev = nlev
+    ! pg-early: a level whose shipped Pg send entries read no ghost another rank fills (xch_own) -- only interior cells and
+    ! the ghosts of the local fill -- reads the same values before the P unpack as after it (the unpack writes other cells)
+    do l = 0, nlev - 1
+      nlate = 0
+      do t = 1, xl(l)%nsg
+        e = xl(l)%sidxg(t)
+        b = ghost_sched%send_b(e); n = domain%blk(b)%dim
+        call xch_transverse_cells ( ghost_sched%send_is(e), ghost_sched%send_js(e), ghost_sched%send_ks(e), &
+                                    ghost_sched%pg_send_fs(e), ghost_sched%pg_send_d11(e), ghost_sched%pg_send_d12(e), &
+                                    ghost_sched%pg_send_d21(e), ghost_sched%pg_send_d22(e), ci, cj, ck )
+        call field_block_index_params ( b, boff, pi, pj )
+        do k = 1, 4
+          if ( ci(k) >= 1 .and. ci(k) <= n(1) .and. cj(k) >= 1 .and. cj(k) <= n(2) .and. ck(k) >= 1 .and. ck(k) <= n(3) ) cycle
+          if ( xch_own( boff + (ci(k)+gc-1) + (cj(k)+gc-1)*pi + (ck(k)+gc-1)*pi*pj + 1 ) > 0 ) nlate = nlate + 1
+        end do
+      end do
+      xl(l)%pg_early = ( nlate == 0 )
+    end do
     deallocate ( smask, rm, smg, rmg, rmr )
   end subroutine xch_build_levels
 

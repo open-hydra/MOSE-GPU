@@ -60,8 +60,9 @@ contains
           write(*,'(A,I0,A,F8.2,A,F8.2)',advance='no') '  L', l, ' ', t_issue(l), ' / ', t_wait(l)
         end do
         write(*,'(A)') ''
-        write(*,'(A,F10.2,A,F10.2,A,F9.2,A,F9.2)') ' [MR]   wall s (rank 0): macro steps ', obj_mr%tmacro, '  stages ', &
-          sum(obj_mr%tlev(0:obj_mr%L)), '  partition ', obj_mr%tpart, '  of which full ', obj_mr%tfull
+        write(*,'(A,F10.2,A,F10.2,A,F9.2,A,F9.2,A,I0,A,I0,A)') ' [MR]   wall s (rank 0): macro steps ', obj_mr%tmacro, &
+          '  stages ', sum(obj_mr%tlev(0:obj_mr%L)), '  partition ', obj_mr%tpart, '  of which full ', obj_mr%tfull, &
+          '  (', obj_mr%nfull, ' full partitions, ', obj_mr%nreuse, ' with the structures kept)'
         if ( obj_mr%nonlocal > 0 ) write(*,'(A,I0,A,I0)') ' [MR]   certificate (mr-nonlocal): violations ', &
           obj_mr%ncert_viol, '  in macro steps ', obj_mr%ncert_steps
         if ( obj_mr%profile ) then
@@ -113,7 +114,7 @@ contains
   !> One Heun stage of level l at tick k: the stage sequence of Explicit_Step with the level's boxes armed.
   subroutine MR_Stage ( domain, config, External_Function, l, irk, k, time_old )
     use MOSE_Types_m
-    use MOSE_Global_m,          only: RANS, VISC
+    use MOSE_Global_m,          only: RANS, VISC, ROTATING_FRAME, soot
     use MOSE_Lib_Extrapolation, only: Fill_Ghost_Cell, Extrapolate_Wall
     use MOSE_Mod_Thermo_Cache,  only: Refresh_Thermo_Cache, thermo_guard_report
     use MOSE_Mod_Fluxes,        only: Fluxes
@@ -130,9 +131,10 @@ contains
     integer,     intent(in) :: l, irk
     integer(I8), intent(in) :: k
     real(R8),    intent(in) :: time_old
-    integer    :: m
+    integer    :: m, q0, qs
     integer(8) :: c0_, c1_, cr_, ct_, cw_, cx_
     real(R8)   :: theta
+    logical    :: fan
     call system_clock ( c0_, cr_ )
     ct_ = c0_
     ! mr-async: the queue of this stage's kernels (the async queue on a list level); a stage off the list path (the block
@@ -142,15 +144,32 @@ contains
     if ( mr_async .and. mr_q /= mr_qid ) then
       !$acc wait(mr_qid)
     end if
-    ! the coarser levels' halo at this stage's time
+    ! the coarser levels' halo at this stage's time; mr-flux-fanout: the levels' interpolations side by side (each writes
+    ! only cells of its own level m), forked from the stage queue and joined back to it
+    fan = mr_halo_near(l) .and. l >= 2 .and. l <= 6 .and. mr_fanout_on()
+    q0 = mr_q
+    if ( fan ) then
+      do m = 0, l - 1
+        qs = mr_fanout_q(m+1)
+        !$acc wait(q0) async(qs)
+      end do
+    end if
     do m = 0, l - 1
       theta = real( k - tau_tick(m), R8 ) / real( 2_I8 ** (obj_mr%L - m), R8 )
       if ( mr_halo_near(l) ) then
+        if ( fan ) mr_q = mr_fanout_q(m+1)
         call MR_Halo_Interp_Near ( m, l, theta )   ! mr-ghost-near: only the halo cells the stage reads
       else
         call MR_Halo_Interp ( m, theta )
       end if
     end do
+    if ( fan ) then
+      mr_q = q0
+      do m = 0, l - 1
+        qs = mr_fanout_q(m+1)
+        !$acc wait(qs) async(q0)
+      end do
+    end if
     call mr_toc ( 1, l, ct_ )
     obj_mr%lcur = l; obj_mr%irkcur = irk; obj_mr%in_stage = .true.
     ! boundary data of type 667 (MOSE_open 410): the state of the file at the stage time
@@ -162,9 +181,10 @@ contains
     halo_level = -1
     call xch_set_level ( -1 )
     call Refresh_Thermo_Cache ( domain ); call mr_toc ( 3, l, ct_ )
-    if ( mr_q_async() .and. .not. mr_list_on() ) then
-      ! mr-async-blk: the block-path fluxes run on the synchronous stream (CUDA Fortran kernels, the interface correction,
-      ! the pass 2): join the queue, run them synchronously, back to the queue for the boundary fluxes and the rest
+    if ( mr_q_async() .and. .not. mr_list_on() .and. ( .not. mr_flux_async() .or. ROTATING_FRAME .or. soot ) ) then
+      ! MOSE_MR_ASYNC_FLUX=0, or a host source (it reads the var-first r on the host): the block-path fluxes on the
+      ! synchronous stream: join the queue, run them synchronously, back to the queue for the boundary fluxes and the rest.
+      ! Otherwise (mr-async-flux) they follow on the stage queue (Lib_Multirate_Base mr_q_flux).
       !$acc wait(mr_q)
       call mr_set_queue_sync ()
       call Fluxes ( domain )
